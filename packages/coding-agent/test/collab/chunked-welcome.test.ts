@@ -170,6 +170,8 @@ function makeTransactionalGuestContext(options: {
 	cancelLocalWithoutBypass?: boolean;
 	restoreFailure?: { remaining: number; error: Error };
 	replicaPostCommitFailure?: Error;
+	replicaBeforeCommit?: () => Promise<void>;
+	replicaAfterCommit?: () => Promise<void>;
 }): TransactionalGuestHarness {
 	let activeSession = LOCAL_SESSION_FILE;
 	const switchedPaths: string[] = [];
@@ -177,9 +179,16 @@ function makeTransactionalGuestContext(options: {
 	const switchOptions: (SessionTransitionOptions | undefined)[] = [];
 	let leaseReleases = 0;
 	const clears = { status: 0, pending: 0 };
+	let transitionRunning = false;
 	const runSessionTransition: SessionTransitionRunner = async (transition, runOptions) => {
+		if (transitionRunning) throw new Error("Session transition is already running");
+		transitionRunning = true;
 		transitionOptions.push(runOptions);
-		return (await transition({})).result;
+		try {
+			return (await transition({})).result;
+		} finally {
+			transitionRunning = false;
+		}
 	};
 	const ctx = {
 		settings: { get: () => "" },
@@ -202,8 +211,10 @@ function makeTransactionalGuestContext(options: {
 					options.restoreFailure.remaining--;
 					throw options.restoreFailure.error;
 				}
+				if (isReplica) await options.replicaBeforeCommit?.();
 				activeSession = sessionPath;
 				switchSessionOptions?.onCommitted?.();
+				if (isReplica) await options.replicaAfterCommit?.();
 				if (isReplica && options.replicaPostCommitFailure) throw options.replicaPostCommitFailure;
 				return true;
 			},
@@ -405,6 +416,124 @@ describe("collab chunked welcome (#3144)", () => {
 			}
 		} finally {
 			connect.mockRestore();
+		}
+	});
+
+	it("waits for a replica commit that races leave before restoring and releasing RPC ownership", async () => {
+		const replicaStarted = Promise.withResolvers<void>();
+		const commitReplica = Promise.withResolvers<void>();
+		const harness = makeTransactionalGuestContext({
+			replicaBeforeCommit: async () => {
+				replicaStarted.resolve();
+				await commitReplica.promise;
+			},
+		});
+		const sockets = new Map<string, CollabSocket>();
+		const connect = spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			sockets.set("guest", this);
+			this.onOpen?.();
+		});
+		try {
+			const joining = joinRpcCollabSession(harness.ctx.session, host.link);
+			let joinSettled = false;
+			const joined = joining.then(
+				() => undefined,
+				error => error,
+			).finally(() => {
+				joinSettled = true;
+			});
+			await Promise.resolve();
+			const socket = sockets.get("guest");
+			if (!socket) throw new Error("guest socket did not open");
+			socket.onFrame?.(
+				{
+					t: "welcome",
+					proto: COLLAB_PROTO,
+					header: snapshot.header as never,
+					state: {} as never,
+					agents: [],
+					entryCount: 0,
+				},
+				0,
+			);
+			await replicaStarted.promise;
+
+			let leaveSettled = false;
+			const leaving = leaveRpcCollabSession(harness.ctx.session).finally(() => {
+				leaveSettled = true;
+			});
+			await Promise.resolve();
+			expect(joinSettled).toBe(false);
+			expect(leaveSettled).toBe(false);
+			expect(harness.leaseReleases()).toBe(0);
+
+			commitReplica.resolve();
+			await leaving;
+			expect(await joined).toBeInstanceOf(Error);
+			expect(harness.activeSession()).toBe(LOCAL_SESSION_FILE);
+			expect((await getRpcCollabStatus(harness.ctx.session)).role).toBe("none");
+			expect(harness.ctx.collabGuest).toBeUndefined();
+			expect(harness.leaseReleases()).toBe(1);
+		} finally {
+			commitReplica.resolve();
+			connect.mockRestore();
+			await leaveRpcCollabSession(harness.ctx.session).catch(() => {});
+		}
+	});
+
+	it("waits for postcommit snapshot cleanup before restoring an immediately left RPC guest", async () => {
+		const replicaCommitted = Promise.withResolvers<void>();
+		const finishSnapshot = Promise.withResolvers<void>();
+		let leaving: Promise<void> | undefined;
+		const harness = makeTransactionalGuestContext({
+			replicaAfterCommit: async () => {
+				leaving = leaveRpcCollabSession(harness.ctx.session);
+				replicaCommitted.resolve();
+				await finishSnapshot.promise;
+			},
+		});
+		const sockets = new Map<string, CollabSocket>();
+		const connect = spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			sockets.set("guest", this);
+			this.onOpen?.();
+		});
+		try {
+			const joining = joinRpcCollabSession(harness.ctx.session, host.link);
+			const joined = joining.then(
+				() => undefined,
+				error => error,
+			);
+			await Promise.resolve();
+			const socket = sockets.get("guest");
+			if (!socket) throw new Error("guest socket did not open");
+			socket.onFrame?.(
+				{
+					t: "welcome",
+					proto: COLLAB_PROTO,
+					header: snapshot.header as never,
+					state: {} as never,
+					agents: [],
+					entryCount: 0,
+				},
+				0,
+			);
+			await replicaCommitted.promise;
+			if (!leaving) throw new Error("leave did not start after replica commit");
+			await Promise.resolve();
+			expect(harness.activeSession()).not.toBe(LOCAL_SESSION_FILE);
+			expect(harness.leaseReleases()).toBe(0);
+
+			finishSnapshot.resolve();
+			await leaving;
+			expect(await joined).toBeInstanceOf(Error);
+			expect(harness.activeSession()).toBe(LOCAL_SESSION_FILE);
+			expect((await getRpcCollabStatus(harness.ctx.session)).role).toBe("none");
+			expect(harness.ctx.collabGuest).toBeUndefined();
+			expect(harness.leaseReleases()).toBe(1);
+		} finally {
+			finishSnapshot.resolve();
+			connect.mockRestore();
+			await leaveRpcCollabSession(harness.ctx.session).catch(() => {});
 		}
 	});
 

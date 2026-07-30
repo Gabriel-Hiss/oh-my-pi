@@ -489,18 +489,36 @@ describe("RPC session transition boundaries", () => {
 			{ id: "branch-btw", type: "branch_btw" },
 			{ id: "navigate", type: "navigate_tree", targetId: "other-leaf" },
 			{ id: "delete", type: "delete_session", sessionPath: "C:/tmp/current.jsonl" },
+			{ id: "handoff", type: "handoff" },
+			{ id: "approve-execute", type: "approve_plan_proposal", strategy: "execute" },
+			{ id: "approve-keep-context", type: "approve_plan_proposal", strategy: "keep-context" },
 			{ id: "after-transitions", type: "get_collab_status" },
 		] satisfies RpcCommand[];
 
 		const running = runRpcMode(fixture.session, undefined, undefined, rpcInput(commands, eofGate.promise));
 		await commandsDispatched.promise;
 
-		for (const id of ["join-second", "new", "switch", "branch", "fork", "branch-btw", "navigate", "delete"]) {
+		for (const id of [
+			"join-second",
+			"new",
+			"switch",
+			"branch",
+			"fork",
+			"branch-btw",
+			"navigate",
+			"delete",
+			"handoff",
+			"approve-execute",
+		]) {
 			expect(observedResponse(frames, id)).toMatchObject({
 				success: false,
 				code: "session_busy",
 			});
 		}
+		expect(observedResponse(frames, "approve-keep-context")).toMatchObject({
+			success: false,
+			code: "operation_failed",
+		});
 		startupGate.resolve();
 		eofGate.resolve();
 		await running;

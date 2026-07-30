@@ -342,6 +342,7 @@ export class CollabGuestLink {
 				return;
 			}
 			this.#ctx.showStatus?.(`Collab session ended (${reason})`);
+			this.#cancel();
 			void this.#restoreLocalSession();
 		};
 		socket.connect();
@@ -354,6 +355,7 @@ export class CollabGuestLink {
 		try {
 			await firstWelcome.promise;
 		} catch (err) {
+			this.#cancel();
 			try {
 				await this.#restoreLocalSession();
 			} catch (restoreError) {
@@ -369,21 +371,27 @@ export class CollabGuestLink {
 			this.#clearSnapshotProgressTimer();
 		}
 
-		if (this.#left) throw new Error("Collab join cancelled");
+		if (this.#left) {
+			await this.#restoreLocalSession();
+			throw new Error("Collab join cancelled");
+		}
 		this.#ctx.collabGuest = this;
 		this.#ctx.syncRunningSubagentBadge?.();
 	}
 
 	/** User-initiated leave (or post-disconnect cleanup): restore the previous session. */
 	async leave(_reason: string): Promise<void> {
-		if (!this.#left) {
-			this.#left = true;
-			this.#joinReject?.(new Error("Collab join cancelled"));
-			this.#clearWelcomeTimer();
-			this.#clearSnapshotProgressTimer();
-			this.#socket?.close();
-		}
+		this.#cancel();
 		await this.#restoreLocalSession();
+	}
+
+	#cancel(): void {
+		if (this.#left) return;
+		this.#left = true;
+		this.#joinReject?.(new Error("Collab join cancelled"));
+		this.#clearWelcomeTimer();
+		this.#clearSnapshotProgressTimer();
+		this.#socket?.close();
 	}
 
 	sendPrompt(text: string, images?: ImageContent[]): void {
@@ -584,7 +592,7 @@ export class CollabGuestLink {
 			}
 			case "bye": {
 				this.#ctx.showStatus?.(`Collab session ended (${frame.reason})`);
-				this.#socket?.close();
+				this.#cancel();
 				void this.#restoreLocalSession();
 				break;
 			}
@@ -813,7 +821,10 @@ export class CollabGuestLink {
 	async #restoreLocalSession(): Promise<void> {
 		if (this.#restoreComplete) return;
 		if (this.#restorePromise) return this.#restorePromise;
-		const restore = this.#performLocalSessionRestore();
+		const restore = (async () => {
+			await this.#applyChain;
+			await this.#performLocalSessionRestore();
+		})();
 		this.#restorePromise = restore;
 		try {
 			await restore;

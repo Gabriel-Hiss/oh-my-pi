@@ -19,11 +19,16 @@ const RPC_SESSION_TRANSITION_COMMANDS: Partial<Record<RpcCommand["type"], true>>
 	branch_btw: true,
 	navigate_tree: true,
 	delete_session: true,
+	handoff: true,
 };
 
 /** Whether a command changes the active session and must reach the transition coordinator. */
 export function isRpcSessionTransitionCommand(command: RpcCommand, deletesActiveSession = false): boolean {
-	return RPC_SESSION_TRANSITION_COMMANDS[command.type] === true && (command.type !== "delete_session" || deletesActiveSession);
+	if (command.type === "approve_plan_proposal") return command.strategy === "execute";
+	return (
+		RPC_SESSION_TRANSITION_COMMANDS[command.type] === true &&
+		(command.type !== "delete_session" || deletesActiveSession)
+	);
 }
 
 /** Returns the protocol error for a session transition attempted by a collaboration guest. */
