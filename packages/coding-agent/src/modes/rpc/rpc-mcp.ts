@@ -375,17 +375,18 @@ export async function beginRpcMCPReauth(
 		},
 		false,
 	).then(result =>
-		queueMCPMutation(session, async () => {
-			const transitionLease = session.acquireSessionTransition();
-			try {
+		queueMCPMutation(session, async () =>
+			session.runSessionTransition(async () => {
 				if (pending.invalidated || pending.generation !== authorizationGeneration(session, pending.plan.name)) {
 					throw new Error(`MCP reauthorization expired because server "${pending.plan.name}" changed or was removed.`);
 				}
-				return await completeMCPReauth({ session, mcpManager }, plan, result);
-			} finally {
-				transitionLease.release();
-			}
-		}),
+				return {
+					result: await completeMCPReauth({ session, mcpManager }, plan, result),
+					committed: false,
+					honorPlanDefault: false,
+				};
+			}),
+		),
 	);
 	pending = { plan, operation, abortController, manualInputs, generation, invalidated: false };
 	const flows = authorizationMap(session);
@@ -419,8 +420,7 @@ export async function completeRpcMCPReauth(
 	if (completion !== undefined) submitManualInput(pending, completion);
 	try {
 		await pending.operation;
-		const transitionLease = session.acquireSessionTransition();
-		try {
+		return await session.runSessionTransition(async () => {
 			if (pending.invalidated || pending.generation !== authorizationGeneration(session, pending.plan.name)) {
 				throw new Error(`MCP reauthorization expired because server "${pending.plan.name}" changed or was removed.`);
 			}
@@ -432,10 +432,12 @@ export async function completeRpcMCPReauth(
 				true,
 				pending.plan.found.discovered,
 			);
-			return { ...result, credentialStored: true };
-		} finally {
-			transitionLease.release();
-		}
+			return {
+				result: { ...result, credentialStored: true },
+				committed: false,
+				honorPlanDefault: false,
+			};
+		});
 	} finally {
 		flows.delete(flowId);
 	}

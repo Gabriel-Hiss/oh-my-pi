@@ -431,7 +431,7 @@ describe("RPC plan proposal guest guard", () => {
 		}
 	});
 
-	test("makes concurrent plan decisions exclusive and holds the transition lease", async () => {
+	test("holds plan decisions through execution preparation, then releases before the turn completes", async () => {
 		const tempDir = TempDir.createSync("@pi-rpc-plan-decision-");
 		try {
 			const planPath = tempDir.join("PLAN.md");
@@ -440,9 +440,19 @@ describe("RPC plan proposal guest guard", () => {
 			await enterRpcPlanMode(plan.session);
 			await submitRpcPlanReview(plan.session, "Exclusive decision");
 			const created = Promise.withResolvers<boolean>();
+			const turnStarted = Promise.withResolvers<void>();
+			const releaseTurn = Promise.withResolvers<void>();
 			plan.newSession.mockImplementation(async () => await created.promise);
+			plan.setPrompt(async () => {
+				turnStarted.resolve();
+				await releaseTurn.promise;
+			});
 
 			const approving = approveRpcPlanProposal(plan.session, undefined, "execute");
+			let acknowledged = false;
+			void approving.then(() => {
+				acknowledged = true;
+			});
 
 			expect(() => plan.session.acquireSessionTransition()).toThrow(
 				"Another RPC session transition is already in progress.",
@@ -450,6 +460,13 @@ describe("RPC plan proposal guest guard", () => {
 			await expect(rejectRpcPlanProposal(plan.session)).rejects.toThrow("A plan decision is already in progress.");
 
 			created.resolve(true);
+			await turnStarted.promise;
+			await new Promise<void>(resolve => setImmediate(resolve));
+			expect(acknowledged).toBe(true);
+			const lease = plan.session.acquireSessionTransition();
+			lease.release();
+			await expect(rejectRpcPlanProposal(plan.session)).resolves.toMatchObject({ decision: "rejected" });
+			releaseTurn.resolve();
 			await expect(approving).resolves.toMatchObject({ decision: "approved" });
 		} finally {
 			await tempDir.remove();
@@ -482,7 +499,7 @@ describe("RPC plan proposal guest guard", () => {
 		}
 	});
 
-	test("holds the transition lease while delayed rejection feedback is pending", async () => {
+	test("releases the plan mutation before an unresolved refinement turn completes", async () => {
 		const tempDir = TempDir.createSync("@pi-rpc-plan-reject-");
 		try {
 			const planPath = tempDir.join("PLAN.md");
@@ -490,15 +507,24 @@ describe("RPC plan proposal guest guard", () => {
 			const plan = createPlanSession({ cwd: tempDir.path(), proposalPath: planPath });
 			await enterRpcPlanMode(plan.session);
 			await submitRpcPlanReview(plan.session, "Rejection plan");
-			const feedback = Promise.withResolvers<void>();
-			plan.setPrompt(async () => await feedback.promise);
+			const refinementStarted = Promise.withResolvers<void>();
+			const releaseRefinement = Promise.withResolvers<void>();
+			plan.setPrompt(async () => {
+				refinementStarted.resolve();
+				await releaseRefinement.promise;
+			});
 
 			const rejecting = rejectRpcPlanProposal(plan.session, "Revise the plan");
-			expect(() => plan.session.acquireSessionTransition()).toThrow(
-				"Another RPC session transition is already in progress.",
-			);
-
-			feedback.resolve();
+			let acknowledged = false;
+			void rejecting.then(() => {
+				acknowledged = true;
+			});
+			await refinementStarted.promise;
+			await new Promise<void>(resolve => setImmediate(resolve));
+			expect(acknowledged).toBe(true);
+			const lease = plan.session.acquireSessionTransition();
+			lease.release();
+			releaseRefinement.resolve();
 			await expect(rejecting).resolves.toMatchObject({ decision: "rejected" });
 		} finally {
 			await tempDir.remove();

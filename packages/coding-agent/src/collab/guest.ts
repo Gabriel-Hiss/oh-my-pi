@@ -343,7 +343,7 @@ export class CollabGuestLink {
 			}
 			this.#ctx.showStatus?.(`Collab session ended (${reason})`);
 			this.#cancel();
-			void this.#restoreLocalSession();
+			this.#restoreLocalSessionAfterDisconnect("connection close");
 		};
 		socket.connect();
 		// Cover the connect phase too: if the relay blackholes the WebSocket
@@ -383,6 +383,15 @@ export class CollabGuestLink {
 	async leave(_reason: string): Promise<void> {
 		this.#cancel();
 		await this.#restoreLocalSession();
+	}
+
+	#restoreLocalSessionAfterDisconnect(source: string): void {
+		void this.#restoreLocalSession().catch(error => {
+			logger.warn("collab guest automatic session restore failed", { source, error: String(error) });
+			this.#ctx.showError?.(
+				`Failed to restore local session after collaboration ended: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		});
 	}
 
 	#cancel(): void {
@@ -593,7 +602,7 @@ export class CollabGuestLink {
 			case "bye": {
 				this.#ctx.showStatus?.(`Collab session ended (${frame.reason})`);
 				this.#cancel();
-				void this.#restoreLocalSession();
+				this.#restoreLocalSessionAfterDisconnect("host goodbye");
 				break;
 			}
 			case "error":

@@ -169,6 +169,9 @@ function makeTransactionalGuestContext(options: {
 	events?: string[];
 	cancelLocalWithoutBypass?: boolean;
 	restoreFailure?: { remaining: number; error: Error };
+	newSessionFailure?: { remaining: number; error: Error };
+	noLocalSession?: boolean;
+	onNewSession?: () => void;
 	replicaPostCommitFailure?: Error;
 	replicaBeforeCommit?: () => Promise<void>;
 	replicaAfterCommit?: () => Promise<void>;
@@ -193,7 +196,7 @@ function makeTransactionalGuestContext(options: {
 	const ctx = {
 		settings: { get: () => "" },
 		sessionManager: {
-			getSessionFile: () => activeSession,
+			getSessionFile: () => (options.noLocalSession && activeSession === LOCAL_SESSION_FILE ? null : activeSession),
 			getSessionName: () => "local",
 			getCwd: () => "/tmp",
 		},
@@ -218,7 +221,15 @@ function makeTransactionalGuestContext(options: {
 				if (isReplica && options.replicaPostCommitFailure) throw options.replicaPostCommitFailure;
 				return true;
 			},
-			newSession: async () => true,
+			newSession: async () => {
+				options.onNewSession?.();
+				if (options.newSessionFailure && options.newSessionFailure.remaining > 0) {
+					options.newSessionFailure.remaining--;
+					throw options.newSessionFailure.error;
+				}
+				activeSession = LOCAL_SESSION_FILE;
+				return true;
+			},
 			messages: [],
 			agent: {
 				state: { model: undefined },
@@ -696,6 +707,65 @@ describe("collab chunked welcome (#3144)", () => {
 			expect(harness.leaseReleases()).toBe(1);
 		} finally {
 			await leaveRpcCollabSession(harness.ctx.session).catch(() => {});
+		}
+	});
+
+	it("reports failed automatic restoration without making leave swallow or lose the retry", async () => {
+		for (const trigger of ["close", "bye"] as const) {
+			const restored = Promise.withResolvers<void>();
+			const restoreFailure = { remaining: 2, error: new Error("local session creation failed") };
+			const harness = makeTransactionalGuestContext({
+				noLocalSession: true,
+				newSessionFailure: restoreFailure,
+				onNewSession: restored.resolve,
+			});
+			const errors: string[] = [];
+			harness.ctx.showError = message => {
+				errors.push(message);
+			};
+			const unhandled: unknown[] = [];
+			const observeUnhandled = (reason: unknown): void => {
+				unhandled.push(reason);
+			};
+			const socketReady = Promise.withResolvers<CollabSocket>();
+			const connect = spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+				socketReady.resolve(this);
+				this.onOpen?.();
+			});
+			process.on("unhandledRejection", observeUnhandled);
+			try {
+				const guest = new CollabGuestLink(harness.ctx);
+				const joining = guest.join(host.link);
+				const socket = await socketReady.promise;
+				socket.onFrame?.(
+					{
+						t: "welcome",
+						proto: COLLAB_PROTO,
+						header: snapshot.header as never,
+						state: {} as never,
+						agents: [],
+						entryCount: 0,
+					},
+					0,
+				);
+				await joining;
+
+				if (trigger === "close") socket.onClose?.("relay closed", false);
+				else socket.onFrame?.({ t: "bye", reason: "host ended" }, 0);
+				await restored.promise;
+				await new Promise<void>(resolve => setImmediate(resolve));
+
+				expect(unhandled).toEqual([]);
+				expect(errors).toEqual([
+					"Failed to restore local session after collaboration ended: local session creation failed",
+				]);
+				await expect(guest.leave("retry")).rejects.toThrow("local session creation failed");
+				await expect(guest.leave("retry again")).resolves.toBeUndefined();
+				expect(harness.activeSession()).toBe(LOCAL_SESSION_FILE);
+			} finally {
+				process.off("unhandledRejection", observeUnhandled);
+				connect.mockRestore();
+			}
 		}
 	});
 

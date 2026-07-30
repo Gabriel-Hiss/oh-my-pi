@@ -201,15 +201,24 @@ export interface RpcPlanApprovalReservation {
 }
 
 
-async function runRpcPlanMutation<T>(session: AgentSession, operation: () => Promise<T>): Promise<T> {
+async function runRpcPlanMutation<T>(
+	session: AgentSession,
+	operation: (release: () => void) => Promise<T>,
+): Promise<T> {
 	const releaseDecision = acquireRpcPlanDecision(session);
 	let transitionLease: SessionTransitionLease | undefined;
-	try {
-		transitionLease = session.acquireSessionTransition();
-		return await operation();
-	} finally {
+	let released = false;
+	const release = (): void => {
+		if (released) return;
+		released = true;
 		transitionLease?.release();
 		releaseDecision();
+	};
+	try {
+		transitionLease = session.acquireSessionTransition();
+		return await operation(release);
+	} finally {
+		release();
 	}
 }
 
@@ -738,7 +747,7 @@ export async function approveRpcPlanProposal(
 			strategy,
 			executionModel,
 			thinkingLevel,
-			ownedReservation.transitionLease,
+			ownedReservation,
 			ownedReservation.proposal,
 		);
 	} finally {
@@ -752,7 +761,7 @@ async function approveRpcPlanProposalLocked(
 	strategy: RpcPlanFinalizationStrategy,
 	executionModel: Model | undefined,
 	thinkingLevel: ConfiguredThinkingLevel | undefined,
-	transitionLease: SessionTransitionLease,
+	reservation: RpcPlanApprovalReservation,
 	proposal: RpcPlanProposalSnapshot,
 ): Promise<RpcPlanDecisionResult> {
 	const runtime = runtimeFor(session);
@@ -779,7 +788,7 @@ async function approveRpcPlanProposalLocked(
 	try {
 		if (strategy === "execute") {
 			const sourceRoot = resolveLocalUrlToPath("local://", localProtocolOptions(session));
-			const created = await transitionLease.run(async transitionOptions => {
+			const created = await reservation.transitionLease.run(async transitionOptions => {
 				const didCreate = await session.newSession(transitionOptions);
 				return {
 					result: didCreate,
@@ -842,10 +851,19 @@ async function approveRpcPlanProposalLocked(
 			planFilePath: proposal.planFilePath,
 			contextPreserved: strategy !== "execute",
 		});
+		reservation.release();
 		if (session.isStreaming) {
-			await session.followUp(executionPrompt, undefined, { synthetic: true });
+			void session.followUp(executionPrompt, undefined, { synthetic: true }).catch(error => {
+				logger.warn("Failed to start RPC plan execution turn", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 		} else {
-			await session.prompt(executionPrompt, { synthetic: true });
+			void session.prompt(executionPrompt, { synthetic: true }).catch(error => {
+				logger.warn("Failed to start RPC plan execution turn", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 		}
 	}
 
@@ -866,17 +884,28 @@ async function approveRpcPlanProposalLocked(
 }
 
 export async function rejectRpcPlanProposal(session: AgentSession, feedback = ""): Promise<RpcPlanDecisionResult> {
-	return runRpcPlanMutation(session, () => rejectRpcPlanProposalLocked(session, feedback));
+	return runRpcPlanMutation(session, release => rejectRpcPlanProposalLocked(session, feedback, release));
 }
 
-async function rejectRpcPlanProposalLocked(session: AgentSession, feedback = ""): Promise<RpcPlanDecisionResult> {
+async function rejectRpcPlanProposalLocked(
+	session: AgentSession,
+	feedback = "",
+	release: () => void,
+): Promise<RpcPlanDecisionResult> {
 	const runtime = runtimeFor(session);
 	const proposal = runtime.planProposal;
 	if (!proposal) throw new Error("No plan proposal is pending.");
 	await abortPlanTurn(session);
 	runtime.planProposal = undefined;
 	const refinement = feedback.trim();
-	if (refinement) await session.prompt(refinement);
+	release();
+	if (refinement) {
+		void session.prompt(refinement).catch(error => {
+			logger.warn("Failed to start RPC plan refinement turn", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+	}
 	return {
 		decision: "rejected",
 		planFilePath: proposal.planFilePath,

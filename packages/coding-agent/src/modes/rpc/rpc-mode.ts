@@ -1960,16 +1960,23 @@ export async function runRpcMode(
 	};
 
 	let activeRpcSessionTransitionOwner: object | undefined;
+	let activeRpcSessionTransitionRelease: Promise<void> | undefined;
+	let rpcSessionTransitionQueue: Promise<void> = Promise.resolve();
 
 	function acquireRpcSessionTransition(): SessionTransitionLease {
 		if (activeRpcSessionTransitionOwner) throw new Error(RPC_SESSION_TRANSITION_BUSY_MESSAGE);
 		const owner = {};
+		const available = Promise.withResolvers<void>();
 		activeRpcSessionTransitionOwner = owner;
+		activeRpcSessionTransitionRelease = available.promise;
 		let running = false;
 		let released = false;
 		let releaseRequested = false;
 		const releaseOwner = (): void => {
-			if (activeRpcSessionTransitionOwner === owner) activeRpcSessionTransitionOwner = undefined;
+			if (activeRpcSessionTransitionOwner !== owner) return;
+			activeRpcSessionTransitionOwner = undefined;
+			activeRpcSessionTransitionRelease = undefined;
+			available.resolve();
 		};
 		return {
 			run: async <T>(
@@ -1999,16 +2006,27 @@ export async function runRpcMode(
 		};
 	}
 
-	async function runReconciledRpcSessionTransition<T>(
+	function runReconciledRpcSessionTransition<T>(
 		transition: (options: SessionTransitionOptions) => Promise<SessionTransitionOutcome<T>>,
 		options?: SessionTransitionRunOptions,
 	): Promise<T> {
-		const lease = acquireRpcSessionTransition();
-		try {
-			return await lease.run(transition, options);
-		} finally {
-			lease.release();
-		}
+		const run = async (): Promise<T> => {
+			while (activeRpcSessionTransitionOwner) {
+				await activeRpcSessionTransitionRelease;
+			}
+			const lease = acquireRpcSessionTransition();
+			try {
+				return await lease.run(transition, options);
+			} finally {
+				lease.release();
+			}
+		};
+		const result = rpcSessionTransitionQueue.then(run, run);
+		rpcSessionTransitionQueue = result.then(
+			() => {},
+			() => {},
+		);
+		return result;
 	}
 
 	async function runOwnedRpcSessionTransition<T>(
