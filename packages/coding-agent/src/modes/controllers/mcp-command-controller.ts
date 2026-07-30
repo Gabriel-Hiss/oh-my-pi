@@ -20,6 +20,8 @@ import {
 import { connectToServer, disconnectServer, listTools } from "../../mcp/client";
 import {
 	addMCPServer,
+	assertMCPServerAbsent,
+	createMCPServerIfAbsent,
 	readDisabledServers,
 	readMCPConfigFile,
 	removeMCPServer,
@@ -645,8 +647,11 @@ export async function completeMCPReauth(
 			if (!current || !Bun.deepEquals(current, plan.found.config)) {
 				throw new Error(`MCP reauthorization expired because server "${plan.name}" changed or was removed.`);
 			}
-			await persistCredential();
-			if (shouldPersist) await updateMCPServer(plan.found.filePath, plan.name, updatedConfig);
+			if (shouldPersist) {
+				await createMCPServerIfAbsent(plan.found.filePath, plan.name, updatedConfig, persistCredential);
+			} else {
+				await assertMCPServerAbsent(plan.found.filePath, plan.name, persistCredential);
+			}
 		} else {
 			await updateExistingMCPServer(plan.found.filePath, plan.name, plan.found.config, updatedConfig, persistCredential);
 		}
@@ -1250,6 +1255,7 @@ export class MCPCommandController {
 			 * installed below instead.
 			 */
 			abortSignal?: AbortSignal;
+			deferCredentialPersistence?: boolean;
 		},
 	): Promise<OAuthFlowResult> {
 		const manualInput = this.ctx.oauthManualInput;
@@ -1352,6 +1358,7 @@ export class MCPCommandController {
 							},
 							signal: oauthTimeout.signal,
 						},
+						!opts?.deferCredentialPersistence,
 					),
 					oauthTimeout.signal,
 					createAbortError,
@@ -1898,6 +1905,7 @@ export class MCPCommandController {
 					serverUrl: plan.serverUrl,
 					resource: plan.oauthResource,
 					stripSameOriginResource: plan.oauthResourceIsFallback,
+					deferCredentialPersistence: true,
 				},
 			);
 			const updatedConfig = await completeMCPReauth(this.ctx, plan, oauthResult, false);

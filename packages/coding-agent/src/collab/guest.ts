@@ -253,6 +253,7 @@ export class CollabGuestLink {
 		this.#roomId = parsed.roomId;
 		this.#writeToken = parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined;
 		const key = await importRoomKey(parsed.key);
+		if (this.#left) throw new Error("Collab join cancelled");
 
 		this.#returnSessionFile = this.#ctx.sessionManager.getSessionFile() ?? null;
 
@@ -264,12 +265,13 @@ export class CollabGuestLink {
 		this.#joinReject = err => firstWelcome.reject(err);
 
 		const finishJoin = (): void => {
-			if (joined) return;
+			if (joined || this.#left) return;
 			joined = true;
 			firstWelcome.resolve();
 		};
 
 		socket.onOpen = () => {
+			if (this.#left) return;
 			// (Re)connect: re-introduce ourselves; the host answers with a fresh
 			// welcome which (re)syncs the replica. Discard any partially-streamed
 			// snapshot from a prior connection: the host will resend the full
@@ -288,6 +290,7 @@ export class CollabGuestLink {
 		socket.onFrame = frame => {
 			this.#applyChain = this.#applyChain
 				.then(async () => {
+					if (this.#left) return;
 					if (frame.t === "welcome") {
 						this.#clearWelcomeTimer();
 						this.#beginWelcome(frame, joined);
@@ -366,12 +369,20 @@ export class CollabGuestLink {
 			this.#clearSnapshotProgressTimer();
 		}
 
+		if (this.#left) throw new Error("Collab join cancelled");
 		this.#ctx.collabGuest = this;
 		this.#ctx.syncRunningSubagentBadge?.();
 	}
 
 	/** User-initiated leave (or post-disconnect cleanup): restore the previous session. */
 	async leave(_reason: string): Promise<void> {
+		if (!this.#left) {
+			this.#left = true;
+			this.#joinReject?.(new Error("Collab join cancelled"));
+			this.#clearWelcomeTimer();
+			this.#clearSnapshotProgressTimer();
+			this.#socket?.close();
+		}
 		await this.#restoreLocalSession();
 	}
 
@@ -436,6 +447,7 @@ export class CollabGuestLink {
 		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}.jsonl`);
 		const lines = [pending.header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
 		await Bun.write(replicaPath, `${lines}\n`);
+		if (this.#left) return;
 
 		// Resume sequence (selector-controller.handleResumeSession) minus
 		// applyCwdChange: the guest process never chdirs to a host path. The
@@ -461,6 +473,7 @@ export class CollabGuestLink {
 		const switched = this.#ctx.runSessionTransition
 			? await this.#ctx.runSessionTransition(switchReplica, { preserveCollabAttachmentOnCommit: true })
 			: await switchReplica({});
+		if (this.#left) return;
 		if (!switched) throw new Error("Collab replica session switch was cancelled.");
 		this.#clearTransientUi();
 		this.#clearAgentMirror();
@@ -477,6 +490,7 @@ export class CollabGuestLink {
 		this.#ctx.chatContainer?.clear();
 		this.#ctx.renderInitialMessages?.({ clearTerminalHistory: true });
 		await this.#ctx.reloadTodos?.();
+		if (this.#left) return;
 		this.#updateStatusSegment();
 		this.#readOnly = pending.readOnly;
 		this.#welcomed = true;

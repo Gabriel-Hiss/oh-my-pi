@@ -86,7 +86,7 @@ import * as rpcMcp from "./rpc-mcp";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import * as rpcModelRoles from "./rpc-model-roles";
 import * as rpcRuntimeControl from "./rpc-runtime-control";
-import { getRpcSessionTransitionGuestBlock } from "./rpc-session-guard";
+import { getRpcSessionTransitionGuestBlock, isRpcSessionTransitionCommand } from "./rpc-session-guard";
 import { buildRpcSessionView } from "./rpc-session-view";
 import { buildRpcSettingsSnapshot, validateRpcSettingValue } from "./rpc-settings";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
@@ -2109,9 +2109,18 @@ export async function runRpcMode(
 		const id = command.id;
 		const collabGuest = rpcCollab.isRpcCollabGuest(session);
 		const collabGuestJoining = rpcCollab.isRpcCollabGuestJoining(session);
+		const activeSessionFile = session.sessionManager.getSessionFile();
 		const guestStartupTransition =
 			collabGuestJoining &&
-			(command.type === "join_collab_session" || command.type === "new_session" || command.type === "switch_session");
+			isRpcSessionTransitionCommand(
+				command,
+				command.type === "delete_session" &&
+					activeSessionFile !== undefined &&
+					path.resolve(command.sessionPath) === path.resolve(activeSessionFile),
+			);
+		if (guestStartupTransition) {
+			return error(id, command.type, RPC_SESSION_TRANSITION_BUSY_MESSAGE, "session_busy");
+		}
 		if (
 			!guestStartupTransition &&
 			(collabGuest || collabGuestJoining) &&

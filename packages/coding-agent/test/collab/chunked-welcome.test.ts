@@ -361,6 +361,53 @@ describe("collab chunked welcome (#3144)", () => {
 		}
 	});
 
+	it("cancels pre-welcome joins and ignores queued or late welcomes after leave", async () => {
+		const sockets = new Map<string, CollabSocket>();
+		const connect = spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			sockets.set("guest", this);
+			this.onOpen?.();
+		});
+		const welcome: CollabFrame = {
+			t: "welcome",
+			proto: COLLAB_PROTO,
+			header: snapshot.header as never,
+			state: {} as never,
+			agents: [],
+			entryCount: 0,
+		};
+		try {
+			for (const mode of ["immediate", "late", "queued"] as const) {
+				sockets.clear();
+				const harness = makeTransactionalGuestContext({});
+				const guest = new CollabGuestLink(harness.ctx);
+				const joining = guest.join(host.link);
+				const joined = joining.then(
+					() => undefined,
+					error => error,
+				);
+				let openedSocket: CollabSocket | undefined;
+				if (mode !== "immediate") {
+					await Promise.resolve();
+					openedSocket = sockets.get("guest");
+					if (!openedSocket) throw new Error("guest socket did not open");
+					if (mode === "queued") openedSocket.onFrame?.(welcome, 0);
+				}
+				await guest.leave("left");
+				const joinError = await joined;
+				if (!(joinError instanceof Error)) throw new Error("join unexpectedly completed");
+				expect(joinError.message).toBe("Collab join cancelled");
+				if (mode === "late") openedSocket?.onFrame?.(welcome, 0);
+				await Promise.resolve();
+
+				if (mode === "immediate") expect(sockets.get("guest")).toBeUndefined();
+				expect(harness.switchedPaths).toEqual([]);
+				expect(harness.ctx.collabGuest).toBeUndefined();
+			}
+		} finally {
+			connect.mockRestore();
+		}
+	});
+
 	it("keeps the local session and mirror intact when the replica switch is cancelled", async () => {
 		const harness = makeTransactionalGuestContext({ cancelReplica: true });
 		const guest = new CollabGuestLink(harness.ctx);

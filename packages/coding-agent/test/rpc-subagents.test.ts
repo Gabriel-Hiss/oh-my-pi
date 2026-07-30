@@ -163,12 +163,16 @@ function captureRpcFrames(onFrame?: (frame: ObservedRpcFrame) => void): Observed
 	return frames;
 }
 
-function rpcInput(commands: readonly RpcCommand[]): ReadableStream<Uint8Array> {
+function rpcInput(commands: readonly RpcCommand[], eof?: Promise<void>): ReadableStream<Uint8Array> {
 	const body = `${commands.map(command => JSON.stringify(command)).join("\n")}\n`;
 	return new ReadableStream<Uint8Array>({
 		start(controller) {
 			controller.enqueue(new TextEncoder().encode(body));
-			controller.close();
+			if (eof) {
+				void eof.then(() => controller.close());
+			} else {
+				controller.close();
+			}
 		},
 	});
 }
@@ -464,9 +468,11 @@ describe("RPC session transition boundaries", () => {
 	test("reserves join before relay startup so every concurrent transition reports session_busy", async () => {
 		const startupGate = Promise.withResolvers<void>();
 		const commandsDispatched = Promise.withResolvers<void>();
+		const eofGate = Promise.withResolvers<void>();
 		const fixture = createRpcModeSession();
 		fixture.newSession.mockResolvedValueOnce(false);
 		fixture.switchSession.mockResolvedValueOnce(false);
+		fixture.session.sessionManager.getSessionFile = () => "C:/tmp/current.jsonl";
 		vi.spyOn(CollabGuestLink.prototype, "join").mockImplementation(async () => {
 			await startupGate.promise;
 		});
@@ -478,20 +484,26 @@ describe("RPC session transition boundaries", () => {
 			{ id: "join-second", type: "join_collab_session", link: "wss://relay.invalid/second" },
 			{ id: "new", type: "new_session" },
 			{ id: "switch", type: "switch_session", sessionPath: "C:/tmp/next.jsonl" },
+			{ id: "branch", type: "branch", entryId: "entry" },
+			{ id: "fork", type: "fork" },
+			{ id: "branch-btw", type: "branch_btw" },
+			{ id: "navigate", type: "navigate_tree", targetId: "other-leaf" },
+			{ id: "delete", type: "delete_session", sessionPath: "C:/tmp/current.jsonl" },
 			{ id: "after-transitions", type: "get_collab_status" },
 		] satisfies RpcCommand[];
 
-		const running = runRpcMode(fixture.session, undefined, undefined, rpcInput(commands));
+		const running = runRpcMode(fixture.session, undefined, undefined, rpcInput(commands, eofGate.promise));
 		await commandsDispatched.promise;
-		startupGate.resolve();
-		await running;
 
-		for (const id of ["join-second", "new", "switch"]) {
+		for (const id of ["join-second", "new", "switch", "branch", "fork", "branch-btw", "navigate", "delete"]) {
 			expect(observedResponse(frames, id)).toMatchObject({
 				success: false,
 				code: "session_busy",
 			});
 		}
+		startupGate.resolve();
+		eofGate.resolve();
+		await running;
 		expect(observedResponse(frames, "join-first")).toMatchObject({ success: true });
 		expect(fixture.newSession).not.toHaveBeenCalled();
 		expect(fixture.switchSession).not.toHaveBeenCalled();

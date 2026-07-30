@@ -142,6 +142,47 @@ export async function addMCPServer(filePath: string, name: string, config: MCPSe
 	});
 }
 
+/** Runs a write callback only while the named server remains absent under the config lock. */
+export async function assertMCPServerAbsent(
+	filePath: string,
+	name: string,
+	beforeWrite: () => Promise<void>,
+): Promise<void> {
+	const nameError = validateServerName(name);
+	if (nameError) throw new Error(nameError);
+	await withConfigLock(filePath, async () => {
+		const existing = await readMCPConfigFile(filePath);
+		if (existing.mcpServers?.[name]) {
+			throw new Error(`MCP reauthorization expired because server "${name}" was created.`);
+		}
+		await beforeWrite();
+	});
+}
+
+/** Create a server only if its name remains absent until the write commits. */
+export async function createMCPServerIfAbsent(
+	filePath: string,
+	name: string,
+	config: MCPServerConfig,
+	beforeWrite?: () => Promise<void>,
+): Promise<void> {
+	const nameError = validateServerName(name);
+	if (nameError) throw new Error(nameError);
+	const errors = validateServerConfig(name, config);
+	if (errors.length > 0) throw new Error(`Invalid server config: ${errors.join("; ")}`);
+	await withConfigLock(filePath, async () => {
+		const existing = await readMCPConfigFile(filePath);
+		if (existing.mcpServers?.[name]) {
+			throw new Error(`MCP reauthorization expired because server "${name}" was created.`);
+		}
+		await beforeWrite?.();
+		await writeMCPConfigFile(filePath, {
+			...existing,
+			mcpServers: { ...existing.mcpServers, [name]: config },
+		});
+	});
+}
+
 /**
  * Update an existing MCP server in a config file.
  * If the server doesn't exist, this will add it.
