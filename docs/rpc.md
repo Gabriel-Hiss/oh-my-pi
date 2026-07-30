@@ -185,6 +185,7 @@ The client MUST send the unchanged buffer, cursor, and selected item to `apply_c
 ### State and host capabilities
 
 - `{ id?, type: "get_state" }`
+- `{ id?, type: "set_fast_mode", enabled: boolean }`
 - `{ id?, type: "get_available_commands" }`
 - `{ id?, type: "get_settings" }`
 - `{ id?, type: "set_setting", path: string, value: unknown }`
@@ -516,6 +517,19 @@ Local-only slash commands may emit `command_output` frames before their `prompt_
 
 ### `get_state` payload
 
+`tokensPerSecond` is a number when output throughput is available and `null`
+otherwise. `fastModeEnabled` reports the session setting, while
+`fastModeActive` reports the actual computed active state. For Fireworks,
+`providers.fireworksTier: priority` is a provider-level setting independent of
+the `/fast` family setting, so `fastModeActive` may remain `true` for an
+unsupported Fireworks model.
+
+For direct Anthropic, a provider rejection of `speed: "fast"` uses a sticky
+fallback scoped by the resolved endpoint and exact model: `fastModeEnabled` may
+remain `true` while `fastModeActive` is `false`. An explicit `set_fast_mode`
+enable expresses retry intent and clears that fallback so the provider attempt
+is re-armed.
+
 ```json
 {
   "model": { "provider": "...", "id": "..." },
@@ -532,6 +546,9 @@ Local-only slash commands may emit `command_output` frames before their `prompt_
   "sessionFile": "...",
   "sessionId": "...",
   "sessionName": "...",
+  "fastModeEnabled": false,
+  "tokensPerSecond": null,
+  "fastModeActive": false,
   "autoCompactionEnabled": true,
   "messageCount": 0,
   "queuedMessageCount": 0,
@@ -776,6 +793,73 @@ Each item has `value`, `label`, and optional `description` and `kind`. After cho
 }
 ```
 
+### `set_fast_mode` payload
+
+`set_fast_mode` changes whether fast mode is enabled for the session. The
+request is:
+
+```json
+{ "id": "req_fast_on", "type": "set_fast_mode", "enabled": true }
+```
+
+On success, `data` always contains both `enabled` and `active`. These are the
+actual computed values: `enabled` reports the session setting, and `active`
+reports the resulting active state, including any provider-level Fireworks
+priority setting:
+
+For direct Anthropic, an explicit enable also re-arms a provider attempt after
+the sticky rejection fallback, even when fast mode was already enabled.
+
+```json
+{
+  "id": "req_fast_on",
+  "type": "response",
+  "command": "set_fast_mode",
+  "success": true,
+  "data": { "enabled": true, "active": true }
+}
+```
+
+Enabling fast mode on a model without a service-tier family fails with the
+exact error below:
+
+```json
+{
+  "id": "req_fast_on",
+  "type": "response",
+  "command": "set_fast_mode",
+  "success": false,
+  "error": "Fast mode is unavailable for the current model."
+}
+```
+
+Disabling fast mode is idempotent, including on an unsupported model. It
+succeeds as an off/no-op result, but disabling `/fast` does not override
+provider-level settings, so a successful disable does not guarantee
+`active: false`. For example, with an unsupported
+`fireworks/deepseek-v4-flash` model and `providers.fireworksTier: priority`,
+the response reports the session setting as disabled while the provider
+priority keeps the computed active state true:
+
+```json
+{
+  "id": "req_fast_off",
+  "type": "response",
+  "command": "set_fast_mode",
+  "success": true,
+  "data": { "enabled": false, "active": true }
+}
+```
+
+The corresponding `get_state` result reports the same computed state:
+
+```json
+{
+  "fastModeEnabled": false,
+  "fastModeActive": true
+}
+```
+
 ### `set_todos` payload
 
 Replaces the in-memory todo state for the current session and returns the normalized phase list:
@@ -876,6 +960,9 @@ The response payload is:
 Schemes are case-insensitive on the wire and normalized to lowercase before
 the response is sent. Re-sending `set_host_uri_schemes` replaces the entire
 previous set — schemes missing from the new list are unregistered.
+
+`security://` is reserved for OMP's producer-neutral software-security resource
+store. RPC hosts cannot register or shadow that scheme.
 
 ## UI Reconstruction
 

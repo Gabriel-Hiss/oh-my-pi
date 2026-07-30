@@ -64,7 +64,7 @@ export async function buildRpcRepoStatus(cwd: string, options: { includePr?: boo
 
 		if (useJj) {
 			const [branch, status] = await withDeadline(git.GIT_COMMAND_TIMEOUT_MS, signal =>
-				Promise.all([jj.workingCopy.label(jjRoot, signal), jj.status.summary(jjRoot, signal)]),
+				Promise.all([jj.workingCopy.label(jjRoot, { signal }), jj.status.summary(jjRoot, { signal })]),
 			);
 			return {
 				...empty,

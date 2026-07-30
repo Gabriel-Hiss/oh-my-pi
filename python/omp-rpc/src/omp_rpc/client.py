@@ -26,6 +26,7 @@ from .protocol import (
     AvailableCommandsUpdateEvent,
     AutoRetryStartEvent,
     BashResult,
+    FastModeResult,
     BranchMessage,
     BranchResult,
     CancellationResult,
@@ -85,6 +86,7 @@ from .protocol import (
     assistant_text,
     parse_agent_messages,
     parse_bash_result,
+    parse_fast_mode_result,
     parse_branch_messages,
     parse_branch_result,
     parse_cancellation_result,
@@ -1568,6 +1570,9 @@ class RpcClient:
     def get_state(self) -> SessionState:
         payload = self._request("get_state")
         return parse_session_state(payload)
+
+    def set_fast_mode(self, enabled: bool) -> FastModeResult:
+        return parse_fast_mode_result(self._request("set_fast_mode", enabled=enabled))
 
     def set_model(self, provider: str, model_id: str) -> ModelInfo:
         payload = self._request("set_model", provider=provider, modelId=model_id)

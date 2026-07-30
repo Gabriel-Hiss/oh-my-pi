@@ -18,6 +18,19 @@ if (Bun.env.MOCK_RPC_IGNORE_SIGTERM === "1") {
 
 const supportsProtocolV2 = Bun.env.MOCK_RPC_V2 === "1";
 const supportsPromptResult = Bun.env.MOCK_RPC_OLD_RUNTIME !== "1";
+const legacyState = {
+	thinkingLevel: "off",
+	isStreaming: false,
+	isCompacting: false,
+	steeringMode: "all",
+	followUpMode: "all",
+	interruptMode: "immediate",
+	sessionId: "mock-session",
+	autoCompactionEnabled: false,
+	messageCount: 0,
+	queuedMessageCount: 0,
+	todoPhases: [],
+};
 let protocolV2Enabled = false;
 let lifecycleScenario:
 	| "queued"
@@ -361,6 +374,26 @@ for await (const line of readLines(Bun.stdin.stream())) {
 				});
 				continue;
 			}
+			if (
+				frame.type === "get_state" &&
+				(Bun.env.MOCK_RPC_LEGACY_STATE === "1" || Bun.env.MOCK_RPC_INVALID_TPS === "1")
+			) {
+				const data = {
+					...legacyState,
+					...(Bun.env.MOCK_RPC_INVALID_TPS === "1"
+						? { fastModeEnabled: false, fastModeActive: false, tokensPerSecond: "invalid" }
+						: {}),
+				};
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data,
+				});
+				continue;
+			}
+
 			writeFrame({
 				id,
 				type: "response",

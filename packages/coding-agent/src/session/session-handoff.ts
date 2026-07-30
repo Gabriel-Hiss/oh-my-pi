@@ -64,7 +64,10 @@ export interface SessionHandoffHost {
 	clearPendingNextTurnMessages(): void;
 	resetTodoCycle(): void;
 	buildDisplaySessionContext(): SessionContext;
-	resetAdvisorRuntimes(): void;
+	resetAdvisorSessionState(): void;
+	drainAndDetachAdvisorRecorders(): Promise<void>;
+	reattachAdvisorRecorderFeeds(): void;
+	clearAdvisorCost(): void;
 	syncTodoPhasesFromBranch(): void;
 }
 
@@ -127,6 +130,8 @@ export class SessionHandoff {
 			}
 		}
 
+		let advisorRecordersDetached = false;
+		let sessionTransitioned = false;
 		try {
 			if (handoffSignal.aborted) {
 				throw new Error("Handoff cancelled");
@@ -230,14 +235,19 @@ export class SessionHandoff {
 			this.#host.assertVibeSessionTransitionAllowed("handoff to a new session");
 
 			const previousSessionState = this.#host.sessionManager.captureState();
-			const bashTransition = this.#host.beginBashSessionTransition();
 			const handoffContent = createHandoffContext(handoffText);
+			advisorRecordersDetached = true;
+			// Stop and settle in-flight advisors while the old-session feeds can still
+			// observe message_end, then mute before opening the replacement session.
+			await this.#host.drainAndDetachAdvisorRecorders();
+			const bashTransition = this.#host.beginBashSessionTransition();
 			try {
 				await this.#host.sessionManager.newSession(
 					previousSessionFile ? { parentSession: previousSessionFile } : undefined,
 				);
 				this.#host.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
 				await this.#host.sessionManager.ensureOnDisk();
+				sessionTransitioned = true;
 			} catch (error) {
 				this.#host.sessionManager.restoreState(previousSessionState);
 				this.#host.finishBashSessionTransition(bashTransition, false);
@@ -254,6 +264,7 @@ export class SessionHandoff {
 			}
 			try {
 				this.#host.markBashSessionTransition(bashTransition);
+				this.#host.clearAdvisorCost();
 			} finally {
 				this.#host.finishBashSessionTransition(bashTransition, true);
 			}
@@ -301,7 +312,8 @@ export class SessionHandoff {
 			// Rebuild agent messages from session
 			const sessionContext = this.#host.buildDisplaySessionContext();
 			this.#host.agent.replaceMessages(sessionContext.messages);
-			this.#host.resetAdvisorRuntimes();
+			this.#host.resetAdvisorSessionState();
+			advisorRecordersDetached = false;
 			this.#host.syncTodoPhasesFromBranch();
 			if (this.#host.extensionRunner) {
 				await this.#host.extensionRunner.emit({
@@ -318,6 +330,10 @@ export class SessionHandoff {
 			}
 			throw error;
 		} finally {
+			if (advisorRecordersDetached) {
+				if (sessionTransitioned) this.#host.resetAdvisorSessionState();
+				else this.#host.reattachAdvisorRecorderFeeds();
+			}
 			sourceSignal?.removeEventListener("abort", onSourceAbort);
 			this.#handoffAbortController = undefined;
 		}

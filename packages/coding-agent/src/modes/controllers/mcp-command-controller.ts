@@ -52,7 +52,13 @@ import {
 	searchSmitheryRegistry,
 	toConfigName,
 } from "../../mcp/smithery-registry";
-import type { MCPAuthChallenge, MCPAuthConfig, MCPServerConfig, MCPServerConnection } from "../../mcp/types";
+import type {
+	MCPAuthChallenge,
+	MCPAuthConfig,
+	MCPConfigFile,
+	MCPServerConfig,
+	MCPServerConnection,
+} from "../../mcp/types";
 import type { AgentSession } from "../../session/agent-session";
 import { shortenPath } from "../../tools/render-utils";
 import { urlHyperlinkAlways } from "../../tui";
@@ -653,7 +659,13 @@ export async function completeMCPReauth(
 				await assertMCPServerAbsent(plan.found.filePath, plan.name, persistCredential);
 			}
 		} else {
-			await updateExistingMCPServer(plan.found.filePath, plan.name, plan.found.config, updatedConfig, persistCredential);
+			await updateExistingMCPServer(
+				plan.found.filePath,
+				plan.name,
+				plan.found.config,
+				updatedConfig,
+				persistCredential,
+			);
 		}
 	} catch (error) {
 		if (persistedCredential) {
@@ -800,6 +812,64 @@ export function buildSmitheryMCPConfig(result: SmitherySearchResult, values: Rec
 		args.push("--config", configJson);
 	}
 	return { ...result.config, args };
+}
+
+/**
+ * Collect the de-duplicated union of every MCP server name we know about:
+ * user config, project config, and any runtime-discovered servers not
+ * already present in either config (`ctx.mcpManager.getAllServerNames()`
+ * covers connections, pending connections, and discovered-but-not-yet-
+ * connected sources).
+ *
+ * `includeDisabledOnly` controls names found only in
+ * `userConfig.disabledServers`, while `includeDisabledConfigured` controls
+ * config entries whose `enabled` flag is false. Both default to true because
+ * callers such as `/mcp list` need the complete union. Autocomplete callers
+ * must disable the categories their target operation cannot accept.
+ *
+ * This is the single source of truth for "every known server name": both
+ * `MCPCommandController#handleList()` and the `/mcp` slash-command argument
+ * completer (server-name autocomplete for `enable`/`disable`/`test`/etc.)
+ * call this instead of re-deriving the union themselves.
+ *
+ * `preloaded` lets a caller that already read both config files (e.g.
+ * `#handleList()`) pass them in and skip the redundant re-read.
+ */
+export async function collectMcpServerNames(
+	ctx: InteractiveModeContext,
+	preloaded?: { userConfig: MCPConfigFile; projectConfig: MCPConfigFile },
+	includeDisabledOnly = true,
+	includeDisabledConfigured = true,
+): Promise<string[]> {
+	let userConfig: MCPConfigFile;
+	let projectConfig: MCPConfigFile;
+	if (preloaded) {
+		({ userConfig, projectConfig } = preloaded);
+	} else {
+		const cwd = getProjectDir();
+		[userConfig, projectConfig] = await Promise.all([
+			readMCPConfigFile(getMCPConfigPath("user", cwd)),
+			readMCPConfigFile(getMCPConfigPath("project", cwd)),
+		]);
+	}
+
+	const names = new Set<string>(includeDisabledOnly ? (userConfig.disabledServers ?? []) : []);
+	const addConfiguredNames = (config: MCPConfigFile): void => {
+		const servers = config.mcpServers;
+		if (!servers) return;
+		for (const name in servers) {
+			const server = servers[name];
+			if (server && (includeDisabledConfigured || server.enabled !== false)) names.add(name);
+		}
+	};
+	addConfiguredNames(userConfig);
+	addConfiguredNames(projectConfig);
+	if (ctx.mcpManager) {
+		for (const name of ctx.mcpManager.getAllServerNames()) {
+			names.add(name);
+		}
+	}
+	return [...names].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
 }
 
 export class MCPCommandController {
@@ -1559,10 +1629,11 @@ export class MCPCommandController {
 
 			// Collect runtime-discovered servers not in config files
 			const configServerNames = new Set([...userServers, ...projectServers]);
-			const disabledServerNames = new Set(await readDisabledServers(userPath));
+			const disabledServerNames = new Set(userConfig.disabledServers ?? []);
 			const discoveredServers: { name: string; source: SourceMeta }[] = [];
 			if (this.ctx.mcpManager) {
-				for (const name of this.ctx.mcpManager.getAllServerNames()) {
+				const allServerNames = await collectMcpServerNames(this.ctx, { userConfig, projectConfig });
+				for (const name of allServerNames) {
 					if (configServerNames.has(name)) continue;
 					if (disabledServerNames.has(name)) continue;
 					const source = this.ctx.mcpManager.getSource(name);

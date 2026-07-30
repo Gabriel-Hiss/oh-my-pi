@@ -17,7 +17,15 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { configureCredentialRedaction, redactSensitiveInObject } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isRecord, logger, normalizePathForComparison, readLines, Snowflake, withTimeout } from "@oh-my-pi/pi-utils";
+import {
+	$env,
+	isRecord,
+	logger,
+	normalizePathForComparison,
+	readLines,
+	Snowflake,
+	withTimeout,
+} from "@oh-my-pi/pi-utils";
 import type { CollabUiRequest, CollabUiResponseValue } from "@oh-my-pi/pi-wire";
 import { reset as resetCapabilities } from "../../capability";
 import { onSettingChanged } from "../../config/settings";
@@ -57,6 +65,7 @@ import { buildAvailableSlashCommands } from "../../slash-commands/available-comm
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../../system-prompt";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
+import { calculateTokensPerSecond } from "../../utils/token-rate";
 import { buildSessionAutocompleteProvider } from "../completions";
 import { loadAllExtensions } from "../components/extensions/state-manager";
 import { shouldSkipHistory } from "../controllers/input-controller";
@@ -573,6 +582,7 @@ const RPC_COLLAB_GUEST_COMMAND_POLICY = {
 	set_model_role: "block",
 	clear_model_role: "block",
 	set_thinking_level: "block",
+	set_fast_mode: "block",
 	cycle_thinking_level: "block",
 	set_steering_mode: "block",
 	set_follow_up_mode: "block",
@@ -2476,9 +2486,12 @@ export async function runRpcMode(
 					sessionId: session.sessionId,
 					sessionName: session.sessionName,
 					autoCompactionEnabled: session.autoCompactionEnabled,
-					messageCount: session.messages.length,
 					queuedMessageCount: session.queuedMessageCount,
 					todoPhases: session.getTodoPhases(),
+					fastModeEnabled: session.isFastModeEnabled(),
+					tokensPerSecond: calculateTokensPerSecond(session.messages, session.isStreaming),
+					fastModeActive: session.isFastModeActive(),
+					messageCount: session.messages.length,
 					systemPrompt: session.systemPrompt,
 					dumpTools: session.agent.state.tools.map(tool => ({
 						name: tool.name,
@@ -2494,6 +2507,17 @@ export async function runRpcMode(
 					})),
 				};
 				return success(id, "get_state", state);
+			}
+
+			case "set_fast_mode": {
+				const supported = session.setFastMode(command.enabled);
+				if (command.enabled && !supported) {
+					return error(id, "set_fast_mode", "Fast mode is unavailable for the current model.");
+				}
+				return success(id, "set_fast_mode", {
+					enabled: session.isFastModeEnabled(),
+					active: session.isFastModeActive(),
+				});
 			}
 
 			case "get_available_commands": {
@@ -2664,7 +2688,10 @@ export async function runRpcMode(
 				try {
 					let executionModel: Model | undefined;
 					if (command.executionModel) {
-						executionModel = await resolveRpcModel(command.executionModel.provider, command.executionModel.modelId);
+						executionModel = await resolveRpcModel(
+							command.executionModel.provider,
+							command.executionModel.modelId,
+						);
 						if (!executionModel) {
 							return error(
 								id,
@@ -3174,37 +3201,40 @@ export async function runRpcMode(
 			case "delete_session": {
 				const target = path.resolve(command.sessionPath);
 				try {
-					const deleted = await runReconciledRpcSessionTransition(async transitionOptions => {
-						const activeSessionFile = session.sessionManager.getSessionFile();
-						if (activeSessionFile !== undefined && target === path.resolve(activeSessionFile)) {
-							if (session.isCompacting) {
-								session.abortCompaction();
-								while (session.isCompacting) await Bun.sleep(10);
+					const deleted = await runReconciledRpcSessionTransition(
+						async transitionOptions => {
+							const activeSessionFile = session.sessionManager.getSessionFile();
+							if (activeSessionFile !== undefined && target === path.resolve(activeSessionFile)) {
+								if (session.isCompacting) {
+									session.abortCompaction();
+									while (session.isCompacting) await Bun.sleep(10);
+								}
+								const created = await session.newSession({ drop: true, ...transitionOptions });
+								if (created) subagentRegistry?.clear();
+								return {
+									result: { deleted: created, known: true },
+									committed: created,
+									honorPlanDefault: created,
+								};
 							}
-							const created = await session.newSession({ drop: true, ...transitionOptions });
-							if (created) subagentRegistry?.clear();
-							return {
-								result: { deleted: created, known: true },
-								committed: created,
-								honorPlanDefault: created,
-							};
-						}
 
-						const known = (await SessionManager.listAll()).some(item => path.resolve(item.path) === target);
-						if (!known) {
+							const known = (await SessionManager.listAll()).some(item => path.resolve(item.path) === target);
+							if (!known) {
+								return {
+									result: { deleted: false, known: false },
+									committed: false,
+									honorPlanDefault: false,
+								};
+							}
+							await new FileSessionStorage().deleteSessionWithArtifacts(target);
 							return {
-								result: { deleted: false, known: false },
+								result: { deleted: true, known: true },
 								committed: false,
 								honorPlanDefault: false,
 							};
-						}
-						await new FileSessionStorage().deleteSessionWithArtifacts(target);
-						return {
-							result: { deleted: true, known: true },
-							committed: false,
-							honorPlanDefault: false,
-						};
-					}, { honorPlanDefaultOnCommit: true });
+						},
+						{ honorPlanDefaultOnCommit: true },
+					);
 					if (!deleted.known) {
 						return error(
 							id,

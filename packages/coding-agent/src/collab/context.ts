@@ -73,11 +73,14 @@ export interface CollabGuestContext {
 	eventController?: { handleEvent(event: AgentSessionEvent): void | Promise<void> };
 	handleEvent?(event: AgentSessionEvent): void;
 	chatContainer?: { clear(): void };
-	statusContainer?: { clear(): void };
+	statusContainer?: { clear(): void; disposeChildren(): void };
 	pendingMessagesContainer?: { clear(): void };
 	compactionQueuedMessages?: unknown[];
 	streamingComponent?: unknown;
 	streamingMessage?: unknown;
 	pendingTools?: { clear(): void };
 	loadingAnimation?: { stop(): void };
+	autoCompactionLoader?: { stop(): void };
+	retryLoader?: { stop(): void };
+	ensureLoadingAnimation?(): void;
 }
