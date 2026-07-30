@@ -120,6 +120,40 @@ describe("RPC runtime loop guest guard", () => {
 			limit: { remaining: 1 },
 		});
 	});
+
+	test("continues after a locally handled prompt without waiting for agent_end", async () => {
+		vi.useFakeTimers();
+		const prompt = vi.fn(async () => false);
+		const session = {
+			isDisposed: false,
+			isStreaming: false,
+			isCompacting: false,
+			hasPostPromptWork: false,
+			subscribe: () => () => {},
+			prompt,
+			settings: { get: () => "prompt" },
+			getVibeModeState: () => undefined,
+		} as unknown as AgentSession;
+		const dispose = installRpcRuntimeControl(session);
+
+		await enableRpcLoop(session, "repeat", "prompt", 2);
+		await flushMicrotasks();
+		expect(prompt).toHaveBeenCalledTimes(1);
+		expect(await readRpcLoopState(session)).toMatchObject({
+			enabled: true,
+			limit: { remaining: 2 },
+		});
+
+		vi.advanceTimersByTime(800);
+		await flushMicrotasks();
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+		expect(await readRpcLoopState(session)).toMatchObject({
+			enabled: true,
+			limit: { remaining: 1 },
+		});
+		dispose();
+	});
 });
 
 describe("RPC runtime transition suspension", () => {
@@ -127,7 +161,7 @@ describe("RPC runtime transition suspension", () => {
 		vi.useFakeTimers();
 		let listener: ((event: AgentSessionEvent) => void) | undefined;
 		let transitionRunner: SessionTransitionRunner = async transition => (await transition({})).result;
-		const prompt = vi.fn(async () => {});
+		const prompt = vi.fn(async () => true);
 		const runSessionTransition: SessionTransitionRunner = (transition, options) =>
 			transitionRunner(transition, options);
 		const runEphemeralTurn = vi.fn(async () => ({ replyText: "One idle recap" }));

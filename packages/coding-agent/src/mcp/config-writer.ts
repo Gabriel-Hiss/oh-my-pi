@@ -176,6 +176,29 @@ export async function updateMCPServer(filePath: string, name: string, config: MC
 	});
 }
 
+/** Update a server only when its persisted configuration still matches the expected snapshot. */
+export async function updateExistingMCPServer(
+	filePath: string,
+	name: string,
+	expected: MCPServerConfig,
+	config: MCPServerConfig,
+): Promise<void> {
+	const nameError = validateServerName(name);
+	if (nameError) throw new Error(nameError);
+	const errors = validateServerConfig(name, config);
+	if (errors.length > 0) throw new Error(`Invalid server config: ${errors.join("; ")}`);
+	await withConfigLock(filePath, async () => {
+		const existing = await readMCPConfigFile(filePath);
+		if (!existing.mcpServers?.[name] || !Bun.deepEquals(existing.mcpServers[name], expected)) {
+			throw new Error(`MCP reauthorization expired because server "${name}" changed or was removed.`);
+		}
+		await writeMCPConfigFile(filePath, {
+			...existing,
+			mcpServers: { ...existing.mcpServers, [name]: config },
+		});
+	});
+}
+
 /**
  * Remove an MCP server from a config file.
  *

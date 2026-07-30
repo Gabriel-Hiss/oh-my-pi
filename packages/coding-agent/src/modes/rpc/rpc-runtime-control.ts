@@ -190,7 +190,11 @@ async function submitLoopPromptWhenReady(session: AgentSession, runtime: RpcRunt
 
 	loop.promptInFlight = true;
 	try {
-		await session.prompt(prompt);
+		const agentInvoked = await session.prompt(prompt);
+		if (!agentInvoked) {
+			loop.promptInFlight = false;
+			scheduleLoopTask(session, runtime, "iterate");
+		}
 	} catch (error) {
 		loop.promptInFlight = false;
 		throw error;

@@ -405,11 +405,27 @@ FAKE_SERVER = textwrap.dedent(
             respond(request_id, "get_branch_messages", {"messages": branch_messages})
         elif command_type == "get_last_assistant_text":
             respond(request_id, "get_last_assistant_text", {"text": last_assistant_text})
+        elif command_type == "set_setting":
+            respond(
+                request_id,
+                "set_setting",
+                {
+                    "path": command["path"],
+                    "value": command.get("value"),
+                    "configured": "value" in command,
+                },
+            )
         elif command_type == "set_session_name":
             session_name = command["name"]
             respond(request_id, "set_session_name", {})
-        elif command_type in {"steer", "follow_up", "abort"}:
+        elif command_type in {"steer", "abort"}:
             respond(request_id, command_type, {})
+        elif command_type == "follow_up":
+            respond(
+                request_id,
+                "follow_up",
+                {"agentInvoked": False, "lifecycleDisposition": "none"},
+            )
         elif command_type in {"prompt", "abort_and_prompt"}:
             respond(
                 request_id,
@@ -2693,6 +2709,11 @@ class RpcClientTests(unittest.TestCase):
 
             client.clear_todos()
             self.assertEqual(client.get_todos(), ())
+            cleared_setting = client.set_setting("shellPath", None)
+            self.assertEqual(
+                cleared_setting,
+                {"path": "shellPath", "value": None, "configured": True},
+            )
 
             client.steer("nudge")
             client.follow_up("later")
@@ -2702,6 +2723,7 @@ class RpcClientTests(unittest.TestCase):
 
             client.abort_and_prompt("say hello")
             client.wait_for_idle(timeout=2.0)
+            self.assertEqual(client._scheduled_agent_runs, client._completed_agent_runs)
             self.assertEqual(client.get_last_assistant_text(), "pong")
 
     def test_protocol_v2_reassembles_chunked_message_pages(self) -> None:

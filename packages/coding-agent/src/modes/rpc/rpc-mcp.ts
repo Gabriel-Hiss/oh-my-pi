@@ -78,10 +78,14 @@ interface PendingMCPAuthorization {
 	operation: Promise<MCPServerConfig>;
 	abortController: AbortController;
 	manualInputs: string[];
+	generation: number;
+	invalidated: boolean;
 	manualWaiter?: ManualInputWaiter;
 }
 
 const pendingAuthorizations = new WeakMap<AgentSession, Map<string, PendingMCPAuthorization>>();
+const authorizationGenerations = new WeakMap<AgentSession, Map<string, number>>();
+const mcpMutationTails = new WeakMap<AgentSession, Promise<void>>();
 
 function authorizationMap(session: AgentSession): Map<string, PendingMCPAuthorization> {
 	let flows = pendingAuthorizations.get(session);
@@ -90,6 +94,61 @@ function authorizationMap(session: AgentSession): Map<string, PendingMCPAuthoriz
 		pendingAuthorizations.set(session, flows);
 	}
 	return flows;
+}
+
+function authorizationGenerationMap(session: AgentSession): Map<string, number> {
+	let generations = authorizationGenerations.get(session);
+	if (!generations) {
+		generations = new Map();
+		authorizationGenerations.set(session, generations);
+	}
+	return generations;
+}
+
+function authorizationGeneration(session: AgentSession, name: string): number {
+	return authorizationGenerationMap(session).get(name) ?? 0;
+}
+
+function invalidateAuthorizationGeneration(session: AgentSession, name: string): void {
+	const generations = authorizationGenerationMap(session);
+	generations.set(name, (generations.get(name) ?? 0) + 1);
+}
+
+function queueMCPMutation<T>(session: AgentSession, operation: () => Promise<T>): Promise<T> {
+	const previous = mcpMutationTails.get(session) ?? Promise.resolve();
+	const result = previous.catch(() => {}).then(operation);
+	mcpMutationTails.set(
+		session,
+		result.then(
+			() => {},
+			() => {},
+		),
+	);
+	return result;
+}
+
+function cancelPendingAuthorization(pending: PendingMCPAuthorization, message: string): Promise<void> {
+	pending.invalidated = true;
+	pending.abortController.abort(message);
+	pending.manualWaiter?.reject(new Error(message));
+	return pending.operation.then(
+		() => {},
+		() => {},
+	);
+}
+
+/** Abort OAuth flows for one server, or every flow when the RPC session changes or shuts down. */
+export function invalidateRpcMCPAuthorizations(session: AgentSession, name?: string): Promise<void> {
+	const flows = authorizationMap(session);
+	const pending = [...flows.entries()].filter(([, flow]) => name === undefined || flow.plan.name === name);
+	if (name !== undefined) invalidateAuthorizationGeneration(session, name);
+	for (const [flowId, flow] of pending) {
+		if (name === undefined) invalidateAuthorizationGeneration(session, flow.plan.name);
+		flows.delete(flowId);
+	}
+	return Promise.all(pending.map(([, flow]) => cancelPendingAuthorization(flow, "MCP OAuth flow cancelled by RPC lifecycle change"))).then(
+		() => {},
+	);
 }
 
 function errorsToRecord(errors: Map<string, string> | undefined): Record<string, string> {
@@ -172,18 +231,21 @@ export async function addRpcMCPServer(
 ): Promise<RpcMCPServerResult> {
 	const serverName = name.trim();
 	if (!serverName) throw new Error("MCP server name is required.");
-	const load = await addMCPServerRuntime({ session, mcpManager }, serverName, config, scope);
-	const state = config.enabled === false ? "disconnected" : await waitForServer(session, mcpManager, serverName);
-	if (state === "connected") await activateMCPServerTools({ session, mcpManager }, serverName);
-	return {
-		name: serverName,
-		scope,
-		changed: true,
-		discovered: false,
-		state,
-		toolCount: serverToolCount(mcpManager, serverName),
-		errors: errorsToRecord(load.errors),
-	};
+	void invalidateRpcMCPAuthorizations(session, serverName);
+	return queueMCPMutation(session, async () => {
+		const load = await addMCPServerRuntime({ session, mcpManager }, serverName, config, scope);
+		const state = config.enabled === false ? "disconnected" : await waitForServer(session, mcpManager, serverName);
+		if (state === "connected") await activateMCPServerTools({ session, mcpManager }, serverName);
+		return {
+			name: serverName,
+			scope,
+			changed: true,
+			discovered: false,
+			state,
+			toolCount: serverToolCount(mcpManager, serverName),
+			errors: errorsToRecord(load.errors),
+		};
+	});
 }
 
 /** Remove a configured server and its live tools. */
@@ -195,16 +257,20 @@ export async function removeRpcMCPServer(
 ): Promise<RpcMCPServerResult> {
 	const serverName = name.trim();
 	if (!serverName) throw new Error("MCP server name is required.");
-	await removeMCPServerRuntime({ session, mcpManager }, serverName, scope);
-	return {
-		name: serverName,
-		scope,
-		changed: true,
-		discovered: false,
-		state: "disconnected",
-		toolCount: 0,
-		errors: {},
-	};
+	const cancelled = invalidateRpcMCPAuthorizations(session, serverName);
+	return queueMCPMutation(session, async () => {
+		await cancelled;
+		await removeMCPServerRuntime({ session, mcpManager }, serverName, scope);
+		return {
+			name: serverName,
+			scope,
+			changed: true,
+			discovered: false,
+			state: "disconnected",
+			toolCount: 0,
+			errors: {},
+		};
+	});
 }
 
 /** Enable or disable a configured/discovered server in persistence and the live manager. */
@@ -216,18 +282,24 @@ export async function setRpcMCPServerEnabled(
 ): Promise<RpcMCPServerResult> {
 	const serverName = name.trim();
 	if (!serverName) throw new Error("MCP server name is required.");
-	const change = await setMCPServerEnabledRuntime({ session, mcpManager }, serverName, enabled);
-	return serverResult(session, mcpManager, serverName, change.scope, change.changed, change.discovered, change.errors);
+	const cancelled = invalidateRpcMCPAuthorizations(session, serverName);
+	return queueMCPMutation(session, async () => {
+		await cancelled;
+		const change = await setMCPServerEnabledRuntime({ session, mcpManager }, serverName, enabled);
+		return serverResult(session, mcpManager, serverName, change.scope, change.changed, change.discovered, change.errors);
+	});
 }
 
 /** Force a complete live MCP rediscovery and tool refresh. */
 export async function reloadRpcMCP(session: AgentSession, mcpManager: MCPManager): Promise<RpcMCPReloadResult> {
-	const result = await reloadMCPRuntime({ session, mcpManager });
-	return {
-		connectedServers: mcpManager.getConnectedServers(),
-		toolCount: mcpManager.getTools().length,
-		errors: errorsToRecord(result.errors),
-	};
+	return queueMCPMutation(session, async () => {
+		const result = await reloadMCPRuntime({ session, mcpManager });
+		return {
+			connectedServers: mcpManager.getConnectedServers(),
+			toolCount: mcpManager.getTools().length,
+			errors: errorsToRecord(result.errors),
+		};
+	});
 }
 
 /** Reconnect one server and replace its live tools. */
@@ -238,8 +310,10 @@ export async function reconnectRpcMCPServer(
 ): Promise<RpcMCPServerResult> {
 	const serverName = name.trim();
 	if (!serverName) throw new Error("MCP server name is required.");
-	await reconnectMCPRuntime({ session, mcpManager }, serverName);
-	return serverResult(session, mcpManager, serverName, null, true, false);
+	return queueMCPMutation(session, async () => {
+		await reconnectMCPRuntime({ session, mcpManager }, serverName);
+		return serverResult(session, mcpManager, serverName, null, true, false);
+	});
 }
 
 /** Remove OMP-managed OAuth credentials and reload the live server. */
@@ -250,8 +324,12 @@ export async function unauthRpcMCPServer(
 ): Promise<RpcMCPServerResult> {
 	const serverName = name.trim();
 	if (!serverName) throw new Error("MCP server name is required.");
-	const change = await unauthMCPServerRuntime({ session, mcpManager }, serverName);
-	return serverResult(session, mcpManager, serverName, change.scope, change.changed, change.discovered);
+	const cancelled = invalidateRpcMCPAuthorizations(session, serverName);
+	return queueMCPMutation(session, async () => {
+		await cancelled;
+		const change = await unauthMCPServerRuntime({ session, mcpManager }, serverName);
+		return serverResult(session, mcpManager, serverName, change.scope, change.changed, change.discovered);
+	});
 }
 
 /** Start proactive MCP OAuth and return the URL instead of opening a browser. */
@@ -262,7 +340,12 @@ export async function beginRpcMCPReauth(
 ): Promise<RpcMCPOAuthBegin> {
 	const serverName = name.trim();
 	if (!serverName) throw new Error("MCP server name is required.");
+	void invalidateRpcMCPAuthorizations(session, serverName);
+	const generation = authorizationGeneration(session, serverName);
 	const plan = await prepareMCPReauth({ session, mcpManager }, serverName);
+	if (generation !== authorizationGeneration(session, serverName)) {
+		throw new Error(`MCP reauthorization expired because server "${serverName}" changed or was removed.`);
+	}
 	const flowId = crypto.randomUUID();
 	const authReady = Promise.withResolvers<{ url: string; launchUrl?: string; instructions?: string }>();
 	const abortController = new AbortController();
@@ -290,8 +373,20 @@ export async function beginRpcMCPReauth(
 			onManualCodeInput: () => nextManualInput(pending),
 			signal: abortController.signal,
 		},
-	).then(result => completeMCPReauth({ session, mcpManager }, plan, result));
-	pending = { plan, operation, abortController, manualInputs };
+	).then(result =>
+		queueMCPMutation(session, async () => {
+			const transitionLease = session.acquireSessionTransition();
+			try {
+				if (pending.invalidated || pending.generation !== authorizationGeneration(session, pending.plan.name)) {
+					throw new Error(`MCP reauthorization expired because server "${pending.plan.name}" changed or was removed.`);
+				}
+				return await completeMCPReauth({ session, mcpManager }, plan, result);
+			} finally {
+				transitionLease.release();
+			}
+		}),
+	);
+	pending = { plan, operation, abortController, manualInputs, generation, invalidated: false };
 	const flows = authorizationMap(session);
 	flows.set(flowId, pending);
 	void operation.catch(authReady.reject);
@@ -323,15 +418,23 @@ export async function completeRpcMCPReauth(
 	if (completion !== undefined) submitManualInput(pending, completion);
 	try {
 		await pending.operation;
-		const result = await serverResult(
-			session,
-			mcpManager,
-			pending.plan.name,
-			pending.plan.found.scope,
-			true,
-			pending.plan.found.discovered,
-		);
-		return { ...result, credentialStored: true };
+		const transitionLease = session.acquireSessionTransition();
+		try {
+			if (pending.invalidated || pending.generation !== authorizationGeneration(session, pending.plan.name)) {
+				throw new Error(`MCP reauthorization expired because server "${pending.plan.name}" changed or was removed.`);
+			}
+			const result = await serverResult(
+				session,
+				mcpManager,
+				pending.plan.name,
+				pending.plan.found.scope,
+				true,
+				pending.plan.found.discovered,
+			);
+			return { ...result, credentialStored: true };
+		} finally {
+			transitionLease.release();
+		}
 	} finally {
 		flows.delete(flowId);
 	}
@@ -342,15 +445,8 @@ export async function cancelRpcMCPReauth(session: AgentSession, flowId: string):
 	const flows = authorizationMap(session);
 	const pending = flows.get(flowId);
 	if (!pending) return;
-	pending.abortController.abort("MCP OAuth flow cancelled by RPC client");
-	pending.manualWaiter?.reject(new Error("MCP OAuth flow cancelled by RPC client"));
-	try {
-		await pending.operation;
-	} catch {
-		// Cancellation owns the expected rejection.
-	} finally {
-		flows.delete(flowId);
-	}
+	flows.delete(flowId);
+	await cancelPendingAuthorization(pending, "MCP OAuth flow cancelled by RPC client");
 }
 
 /** Start Smithery CLI authorization without opening its URL. */

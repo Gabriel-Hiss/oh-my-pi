@@ -19,6 +19,7 @@ import {
 	type RpcTransientModeSuspension,
 	readRpcPlanModeState,
 	rejectRpcPlanProposal,
+	reserveRpcPlanApproval,
 	submitRpcPlanReview,
 } from "../src/modes/rpc/rpc-work-modes";
 import type { PlanModeState } from "../src/plan-mode/state";
@@ -79,10 +80,22 @@ function createPlanSession(options?: { cwd?: string; proposalPath?: string }) {
 	let nextModelRestoreError: Error | undefined;
 	let planModeState: PlanModeState | undefined;
 	let planProposalHandler: PlanProposalHandler | undefined;
+	let prompt: (text: string) => Promise<void> = async () => {};
 	const newSession = vi.fn(async () => true);
 	let transitionRunner: SessionTransitionRunner = async transition => (await transition({})).result;
 	const runSessionTransition: SessionTransitionRunner = (transition, transitionOptions) =>
 		transitionRunner(transition, transitionOptions);
+	let transitionReserved = false;
+	const acquireSessionTransition = () => {
+		if (transitionReserved) throw new Error("Another RPC session transition is already in progress.");
+		transitionReserved = true;
+		return {
+			run: runSessionTransition,
+			release: () => {
+				transitionReserved = false;
+			},
+		};
+	};
 	const session = {
 		sessionManager,
 		isStreaming: false,
@@ -104,7 +117,7 @@ function createPlanSession(options?: { cwd?: string; proposalPath?: string }) {
 		setPlanProposalHandler: (handler: PlanProposalHandler | null) => {
 			planProposalHandler = handler ?? undefined;
 		},
-		prompt: async () => {},
+		prompt: (text: string) => prompt(text),
 		followUp: async () => {},
 		preparePlanForReview: async (title: string) => ({
 			details: {
@@ -137,6 +150,7 @@ function createPlanSession(options?: { cwd?: string; proposalPath?: string }) {
 		setThinkingLevel: () => {},
 		newSession,
 		runSessionTransition,
+		acquireSessionTransition,
 		markPlanInternalAbortPending: () => {},
 		clearPlanInternalAbortPending: () => {},
 		setPlanReferencePath: () => {},
@@ -153,6 +167,9 @@ function createPlanSession(options?: { cwd?: string; proposalPath?: string }) {
 		},
 		failNextModelRestore: (error: Error) => {
 			nextModelRestoreError = error;
+		},
+		setPrompt: (next: (text: string) => Promise<void>) => {
+			prompt = next;
 		},
 		setTransitionRunner: (runner: SessionTransitionRunner) => {
 			transitionRunner = runner;
@@ -376,6 +393,80 @@ describe("RPC plan proposal guest guard", () => {
 				"Plan execution session creation was cancelled.",
 			);
 			expect(plan.newSession).toHaveBeenCalledTimes(2);
+		} finally {
+			await tempDir.remove();
+		}
+	});
+
+	test("makes concurrent plan decisions exclusive and holds the transition lease", async () => {
+		const tempDir = TempDir.createSync("@pi-rpc-plan-decision-");
+		try {
+			const planPath = tempDir.join("PLAN.md");
+			await Bun.write(planPath, "# Exclusive decision\n");
+			const plan = createPlanSession({ cwd: tempDir.path(), proposalPath: planPath });
+			await enterRpcPlanMode(plan.session);
+			await submitRpcPlanReview(plan.session, "Exclusive decision");
+			const created = Promise.withResolvers<boolean>();
+			plan.newSession.mockImplementation(async () => await created.promise);
+
+			const approving = approveRpcPlanProposal(plan.session, undefined, "execute");
+
+			expect(() => plan.session.acquireSessionTransition()).toThrow(
+				"Another RPC session transition is already in progress.",
+			);
+			await expect(rejectRpcPlanProposal(plan.session)).rejects.toThrow("A plan decision is already in progress.");
+
+			created.resolve(true);
+			await expect(approving).resolves.toMatchObject({ decision: "approved" });
+		} finally {
+			await tempDir.remove();
+		}
+	});
+
+	test("reserves the proposal and transition before delayed model resolution", async () => {
+		const tempDir = TempDir.createSync("@pi-rpc-plan-reservation-");
+		try {
+			const planPath = tempDir.join("PLAN.md");
+			await Bun.write(planPath, "# Reserved decision\n");
+			const plan = createPlanSession({ cwd: tempDir.path(), proposalPath: planPath });
+			await enterRpcPlanMode(plan.session);
+			await submitRpcPlanReview(plan.session, "Reserved decision");
+
+			const reservation = reserveRpcPlanApproval(plan.session);
+			expect(() => plan.session.acquireSessionTransition()).toThrow(
+				"Another RPC session transition is already in progress.",
+			);
+			await expect(rejectRpcPlanProposal(plan.session)).rejects.toThrow("A plan decision is already in progress.");
+			await expect(submitRpcPlanReview(plan.session, "Replacement")).rejects.toThrow(
+				"A plan decision is already in progress.",
+			);
+			await expect(exitRpcPlanMode(plan.session)).rejects.toThrow("A plan decision is already in progress.");
+
+			reservation.release();
+			await expect(rejectRpcPlanProposal(plan.session)).resolves.toMatchObject({ decision: "rejected" });
+		} finally {
+			await tempDir.remove();
+		}
+	});
+
+	test("holds the transition lease while delayed rejection feedback is pending", async () => {
+		const tempDir = TempDir.createSync("@pi-rpc-plan-reject-");
+		try {
+			const planPath = tempDir.join("PLAN.md");
+			await Bun.write(planPath, "# Rejection plan\n");
+			const plan = createPlanSession({ cwd: tempDir.path(), proposalPath: planPath });
+			await enterRpcPlanMode(plan.session);
+			await submitRpcPlanReview(plan.session, "Rejection plan");
+			const feedback = Promise.withResolvers<void>();
+			plan.setPrompt(async () => await feedback.promise);
+
+			const rejecting = rejectRpcPlanProposal(plan.session, "Revise the plan");
+			expect(() => plan.session.acquireSessionTransition()).toThrow(
+				"Another RPC session transition is already in progress.",
+			);
+
+			feedback.resolve();
+			await expect(rejecting).resolves.toMatchObject({ decision: "rejected" });
 		} finally {
 			await tempDir.remove();
 		}

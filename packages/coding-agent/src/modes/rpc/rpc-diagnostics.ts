@@ -305,3 +305,12 @@ export function resolveRpcMcpAuthChallenge(
 	challenge.resolve(config);
 	return true;
 }
+
+/** Resolve outstanding MCP authorization challenges during RPC teardown. */
+export function disposeRpcMcpAuthChallenges(controller: RpcMcpAuthChallengeController): void {
+	const pending = mcpAuthStates.get(controller);
+	if (!pending) return;
+	for (const { resolve } of pending.values()) resolve(undefined);
+	pending.clear();
+	mcpAuthStates.delete(controller);
+}

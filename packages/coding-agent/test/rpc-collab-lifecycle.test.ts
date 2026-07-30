@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
 import { CollabHost } from "../src/collab/host";
+import { CollabSocket } from "../src/collab/relay-client";
 import {
 	disposeRpcCollab,
 	getRpcCollabStatus,
@@ -35,7 +36,7 @@ describe("RPC collaboration hosting lifecycle", () => {
 			const second = startRpcCollabHosting(session, "wss://relay.example.com");
 			const disposal = disposeRpcCollab(session);
 			expect(start).toHaveBeenCalledTimes(1);
-			expect(stop).not.toHaveBeenCalled();
+			expect(stop).toHaveBeenCalledTimes(1);
 
 			startupGate.resolve();
 			const [firstLinks, secondLinks] = await Promise.all([first, second, disposal]);
@@ -72,6 +73,36 @@ describe("RPC collaboration hosting lifecycle", () => {
 			await stopRpcCollabHosting(session);
 			expect(stop).toHaveBeenCalledTimes(2);
 			expect((await getRpcCollabStatus(session)).role).toBe("none");
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("does not publish a host stopped while its relay connection opens", async () => {
+		const subscribe = vi.fn(() => () => {});
+		const sessionManager = {
+			getSessionId: () => "session-1",
+			onEntryAppended: undefined,
+		};
+		const context = {
+			session: { subscribe, emitNotice: () => {} },
+			sessionManager,
+			collabHost: undefined,
+		};
+		const host = new CollabHost(context as never);
+		try {
+			const close = vi.spyOn(CollabSocket.prototype, "close").mockImplementation(() => {});
+			vi.spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+				void host.stop("session ended");
+				this.onOpen?.();
+			});
+
+			await expect(host.start("wss://relay.example.com")).rejects.toThrow("Collab host stopped during startup");
+
+			expect(close).toHaveBeenCalled();
+			expect(subscribe).not.toHaveBeenCalled();
+			expect(sessionManager.onEntryAppended).toBeUndefined();
+			expect(context.collabHost).toBeUndefined();
 		} finally {
 			vi.restoreAllMocks();
 		}

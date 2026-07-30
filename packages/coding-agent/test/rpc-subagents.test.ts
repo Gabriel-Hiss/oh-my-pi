@@ -259,6 +259,9 @@ function createRpcModeSession() {
 		setGoalModeState: () => {},
 		setVibeModeState: () => {},
 		setPlanProposalHandler: () => {},
+		abortBash: () => {},
+		abortEval: () => {},
+		abort: async () => {},
 		emitNotice: () => {},
 		dispose: async () => {},
 	} as unknown as AgentSession;
@@ -359,6 +362,74 @@ describe("RPC session transition boundaries", () => {
 			allowAskReopen: true,
 			reanswerAskResult: undefined,
 		});
+	});
+
+	test("re-enters persisted and default plan modes inside an owned session transition", async () => {
+		for (const scenario of [
+			{ id: "persisted-plan", mode: "plan" as const, defaultOnStartup: false, planFilePath: "local://saved-plan.md" },
+			{ id: "default-plan", mode: "none" as const, defaultOnStartup: true, planFilePath: "local://PLAN.md" },
+		]) {
+			const fixture = createRpcModeSession();
+			let committed = false;
+			let activeTools = ["read"];
+			let planState: unknown;
+			const appendModeChange = vi.fn();
+			Object.assign(fixture.session.sessionManager, {
+				getEntries: () => [],
+				appendModeChange,
+				buildSessionContext: () =>
+					committed
+						? {
+								mode: scenario.mode,
+								modeData: scenario.mode === "plan" ? { planFilePath: scenario.planFilePath } : undefined,
+								messages: scenario.mode === "plan" ? [{}] : [],
+							}
+						: { mode: "none", modeData: undefined, messages: [] },
+			});
+			Object.assign(fixture.session, {
+				settings: {
+					get: (path: string) =>
+						path === "plan.enabled" || (path === "plan.defaultOnStartup" && scenario.defaultOnStartup && committed),
+					getGroup: () => ({}),
+				},
+				waitForIdle: async () => {},
+				getPlanModeState: () => planState,
+				setPlanModeState: (state: unknown) => {
+					planState = state;
+				},
+				getEnabledToolNames: () => [...activeTools],
+				setActiveToolsByName: async (tools: string[]) => {
+					activeTools = [...tools];
+				},
+				hasBuiltInTool: (name: string) => name === "write",
+				getPlanReferencePath: () => undefined,
+				configuredThinkingLevel: () => undefined,
+				resolveRoleModelWithThinking: () => ({
+					model: undefined,
+					thinkingLevel: undefined,
+					explicitThinkingLevel: false,
+				}),
+				setThinkingLevel: () => {},
+				setModelTemporary: async () => {},
+			});
+			fixture.newSession.mockImplementationOnce(async options => {
+				await options?.beforeCommit?.();
+				committed = true;
+				options?.onCommitted?.();
+				return true;
+			});
+			const frames = captureRpcFrames();
+			try {
+				await runRpcMode(fixture.session, undefined, undefined, rpcInput([{ id: scenario.id, type: "new_session" }]));
+
+				expect(observedResponse(frames, scenario.id)).toMatchObject({ success: true });
+				expect(planState).toMatchObject({ enabled: true, planFilePath: scenario.planFilePath });
+				expect(activeTools).toEqual(["read", "write"]);
+				expect(appendModeChange).toHaveBeenCalledWith("plan", { planFilePath: scenario.planFilePath });
+			} finally {
+				vi.restoreAllMocks();
+			}
+		}
 	});
 
 	test("reserves join before relay startup so every concurrent transition reports session_busy", async () => {
@@ -1137,7 +1208,7 @@ function handle(frame) {
 `,
 		);
 
-		using client = new RpcClient({ cliPath: scriptPath });
+		const client = new RpcClient({ cliPath: scriptPath });
 		const lifecycleIds: string[] = [];
 		const progressTasks: string[] = [];
 		const rawEventTypes: string[] = [];
@@ -1147,17 +1218,21 @@ function handle(frame) {
 		client.onSubagentEvent(payload => rawEventTypes.push(payload.event.type));
 		client.onSessionEvent(event => sessionEventTypes.push(event.type));
 
-		await client.start();
-		await expect(client.setSubagentSubscription("events")).resolves.toBe("events");
-		await client.promptAndWait("Trigger subagent frames");
-		expect(await client.getSubagents()).toHaveLength(1);
-		expect(await client.getSubagentMessages({ sessionFile: "/tmp/subagent.jsonl" })).toMatchObject({
-			sessionFile: "/tmp/subagent.jsonl",
-		});
+		try {
+			await client.start();
+			expect(await client.setSubagentSubscription("events")).toBe("events");
+			await client.promptAndWait("Trigger subagent frames");
+			expect(await client.getSubagents()).toHaveLength(1);
+			expect(await client.getSubagentMessages({ sessionFile: "/tmp/subagent.jsonl" })).toMatchObject({
+				sessionFile: "/tmp/subagent.jsonl",
+			});
 
-		expect(lifecycleIds).toEqual(["SubagentA"]);
-		expect(progressTasks).toEqual(["Do work"]);
-		expect(rawEventTypes).toEqual(["agent_start"]);
-		expect(sessionEventTypes).toContain("notice");
+			expect(lifecycleIds).toEqual(["SubagentA"]);
+			expect(progressTasks).toEqual(["Do work"]);
+			expect(rawEventTypes).toEqual(["agent_start"]);
+			expect(sessionEventTypes).toContain("notice");
+		} finally {
+			client.stop();
+		}
 	});
 });

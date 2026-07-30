@@ -7,7 +7,11 @@ import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import * as mcpClient from "@oh-my-pi/pi-coding-agent/mcp/client";
 import * as oauthFlow from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
 import type { MCPServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
-import { MCPCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/mcp-command-controller";
+import {
+	completeMCPReauth,
+	type MCPReauthPlan,
+	MCPCommandController,
+} from "@oh-my-pi/pi-coding-agent/modes/controllers/mcp-command-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import {
 	getConfigRootDir,
@@ -171,11 +175,40 @@ describe("/mcp auth commands", () => {
 		});
 		expect(authStorage.get(oauthFlow.mcpOAuthCredentialId(RAW_SERVER_URL))).toBeUndefined();
 
+
 		const saved = JSON.parse(await Bun.file(configPath).text()) as TestConfigFile;
 		const savedServer = saved.mcpServers?.envserver;
 		const savedUrl = savedServer?.type === "http" || savedServer?.type === "sse" ? savedServer.url : undefined;
 		expect(savedUrl).toBe(RAW_SERVER_URL);
 		expect(savedServer?.auth).toBeUndefined();
+	});
+
+	test("does not recreate a removed server when an OAuth flow completes", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.reload();
+		const config = { type: "http" as const, url: RAW_SERVER_URL };
+		await Bun.write(configPath, JSON.stringify({ mcpServers: {} }));
+		const plan: MCPReauthPlan = {
+			name: "envserver",
+			found: { filePath: configPath, scope: "project", config, discovered: false },
+			baseConfig: config,
+			oauth: { authorizationUrl: "https://auth.example.com/authorize", tokenUrl: "https://auth.example.com/token" },
+			serverUrl: EXPANDED_SERVER_URL,
+			flowClientId: "",
+			flowClientSecret: "",
+			oauthResource: EXPANDED_SERVER_URL,
+			oauthResourceIsFallback: false,
+		};
+
+		await expect(
+			completeMCPReauth(
+				{ session: { modelRegistry: { authStorage } } } as never,
+				plan,
+				{ credentialId: "new-credential" } as never,
+				false,
+			),
+		).rejects.toThrow('server "envserver" changed or was removed');
+		expect(JSON.parse(await Bun.file(configPath).text())).toEqual({ mcpServers: {} });
 	});
 
 	test("uses the registration endpoint discovered from a pathful issuer", async () => {

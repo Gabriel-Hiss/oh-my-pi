@@ -266,6 +266,12 @@ export class CollabHost {
 			clearTimeout(timeout);
 		}
 
+		if (this.#stopped) {
+			socket.close();
+			this.#socket = null;
+			throw new Error("Collab host stopped during startup");
+		}
+
 		this.#unsubscribe = this.#ctx.session.subscribe(event => {
 			if (isWireAgentEvent(event)) this.#broadcast({ t: "event", event: shrinkForReplication(event) });
 			this.#onEventForState(event);

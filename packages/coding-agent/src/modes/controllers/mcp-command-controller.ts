@@ -24,6 +24,7 @@ import {
 	readMCPConfigFile,
 	removeMCPServer,
 	setServerDisabled,
+	updateExistingMCPServer,
 	updateMCPServer,
 } from "../../mcp/config-writer";
 import {
@@ -610,14 +611,6 @@ export async function completeMCPReauth(
 	result: OAuthFlowResult,
 	reload = true,
 ): Promise<MCPServerConfig> {
-	const authStorage = ctx.session.modelRegistry.authStorage;
-	if (
-		plan.currentAuth?.type === "oauth" &&
-		plan.currentAuth.credentialId &&
-		plan.currentAuth.credentialId !== result.credentialId
-	) {
-		await removeManagedMcpOAuthCredential(authStorage, plan.currentAuth.credentialId);
-	}
 	const urlKeyedId = plan.serverUrl ? mcpOAuthCredentialId(plan.serverUrl) : undefined;
 	const shouldPersist = Boolean(plan.currentAuth) || result.credentialId !== urlKeyedId;
 	const updatedConfig = shouldPersist
@@ -629,7 +622,23 @@ export async function completeMCPReauth(
 				stripSameOriginResource: plan.oauthResourceIsFallback,
 			})
 		: plan.baseConfig;
-	if (shouldPersist) await updateMCPServer(plan.found.filePath, plan.name, updatedConfig);
+	if (plan.found.discovered) {
+		const current = ctx.mcpManager?.getServerConfig(plan.name);
+		if (!current || !Bun.deepEquals(current, plan.found.config)) {
+			throw new Error(`MCP reauthorization expired because server "${plan.name}" changed or was removed.`);
+		}
+		if (shouldPersist) await updateMCPServer(plan.found.filePath, plan.name, updatedConfig);
+	} else {
+		await updateExistingMCPServer(plan.found.filePath, plan.name, plan.found.config, updatedConfig);
+	}
+	const authStorage = ctx.session.modelRegistry.authStorage;
+	if (
+		plan.currentAuth?.type === "oauth" &&
+		plan.currentAuth.credentialId &&
+		plan.currentAuth.credentialId !== result.credentialId
+	) {
+		await removeManagedMcpOAuthCredential(authStorage, plan.currentAuth.credentialId);
+	}
 	if (reload) await reloadMCPRuntime(ctx);
 	return updatedConfig;
 }

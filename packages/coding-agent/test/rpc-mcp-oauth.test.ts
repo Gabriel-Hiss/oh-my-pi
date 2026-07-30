@@ -1,0 +1,47 @@
+import { afterEach, describe, expect, test, vi } from "bun:test";
+import * as mcpCommands from "../src/modes/controllers/mcp-command-controller";
+import {
+	beginRpcMCPReauth,
+	completeRpcMCPReauth,
+	invalidateRpcMCPAuthorizations,
+} from "../src/modes/rpc/rpc-mcp";
+import type { AgentSession } from "../src/session/agent-session";
+
+const session = {} as AgentSession;
+const manager = {} as never;
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
+
+describe("RPC MCP OAuth lifecycle", () => {
+	test("removal and session transitions cancel stale OAuth flows before they can complete", async () => {
+		for (const invalidation of ["remove", "session transition"] as const) {
+			const authorization = Promise.withResolvers<never>();
+			let signal: AbortSignal | undefined;
+			vi.spyOn(mcpCommands, "prepareMCPReauth").mockResolvedValue({
+				name: "demo",
+				found: { filePath: "mcp.json", scope: "project", config: { type: "http", url: "https://demo.test" }, discovered: false },
+				baseConfig: { type: "http", url: "https://demo.test" },
+				oauth: { authorizationUrl: "https://auth.demo.test", tokenUrl: "https://auth.demo.test/token" },
+				flowClientId: "",
+				flowClientSecret: "",
+				oauthResourceIsFallback: false,
+			} as never);
+			vi.spyOn(mcpCommands, "authorizeMCP").mockImplementation(async (_session, _request, callbacks) => {
+				signal = callbacks.signal;
+				callbacks.onAuth({ url: "https://auth.demo.test/authorize" });
+				return await authorization.promise;
+			});
+
+			const begun = await beginRpcMCPReauth(session, manager, "demo");
+			const cancelled = invalidateRpcMCPAuthorizations(session, invalidation === "remove" ? "demo" : undefined);
+
+			expect(signal?.aborted).toBe(true);
+			await expect(completeRpcMCPReauth(session, manager, begun.flowId)).rejects.toThrow("Unknown or expired MCP OAuth flow");
+			authorization.reject(new Error("cancelled"));
+			await cancelled;
+			vi.restoreAllMocks();
+		}
+	});
+});

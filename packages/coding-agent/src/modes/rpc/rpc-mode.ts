@@ -17,7 +17,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { configureCredentialRedaction, redactSensitiveInObject } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isRecord, logger, normalizePathForComparison, readLines, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, logger, normalizePathForComparison, readLines, Snowflake, withTimeout } from "@oh-my-pi/pi-utils";
 import type { CollabUiRequest, CollabUiResponseValue } from "@oh-my-pi/pi-wire";
 import { reset as resetCapabilities } from "../../capability";
 import { onSettingChanged } from "../../config/settings";
@@ -467,17 +467,11 @@ const BACKGROUND_RPC_COMMAND_TYPES: Partial<Record<RpcCommand["type"], true>> = 
 	begin_guided_goal: true,
 	prompt_agent: true,
 	generate_ttsr_rule: true,
-	mcp_add_server: true,
-	mcp_set_server_enabled: true,
-	mcp_reload: true,
-	mcp_reconnect_server: true,
-	mcp_unauth_server: true,
 	mcp_begin_reauth: true,
 	mcp_complete_reauth: true,
 	mcp_begin_smithery_login: true,
 	mcp_complete_smithery_login: true,
 	mcp_search_registry: true,
-	mcp_deploy_registry_result: true,
 };
 
 /**
@@ -746,9 +740,12 @@ export class RpcInputDispatcher {
 			);
 			this.#tail = task.catch(() => {});
 			this.#tasks.add(task);
-			void task.finally(() => {
-				this.#tasks.delete(task);
-			});
+			void task
+				.finally(() => {
+					this.#tasks.delete(task);
+					void this.#afterSerialCommand?.().catch(() => {});
+				})
+				.catch(() => {});
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			const id = isRecord(parsed) && typeof parsed.id === "string" ? parsed.id : undefined;
@@ -777,8 +774,6 @@ export class RpcInputDispatcher {
 					message === RPC_SESSION_TRANSITION_BUSY_MESSAGE ? "session_busy" : undefined,
 				),
 			);
-		} finally {
-			await this.#afterSerialCommand?.();
 		}
 	}
 }
@@ -798,10 +793,16 @@ export class RpcShutdownCoordinator {
 	#tasks = new Set<Promise<void>>();
 	#shutdown: Promise<void> | undefined;
 	readonly #isShutdownRequested: () => boolean;
+	readonly #cancel: () => Promise<void>[];
 	readonly #performShutdown: () => Promise<void>;
 
-	constructor(options: { isShutdownRequested: () => boolean; performShutdown: () => Promise<void> }) {
+	constructor(options: {
+		isShutdownRequested: () => boolean;
+		cancel?: () => Promise<void>[];
+		performShutdown: () => Promise<void>;
+	}) {
 		this.#isShutdownRequested = options.isShutdownRequested;
+		this.#cancel = options.cancel ?? (() => []);
 		this.#performShutdown = options.performShutdown;
 	}
 
@@ -828,16 +829,29 @@ export class RpcShutdownCoordinator {
 		}
 	}
 
-	/**
-	 * If shutdown was requested, drain background tasks (so every owed
-	 * response frame is written) before running the shutdown sequence.
-	 */
-	checkShutdownRequested(): Promise<void> {
+	/** Start the shared cancel-first shutdown sequence once. */
+	shutdown(): Promise<void> {
 		if (!this.#shutdown) {
-			if (!this.#isShutdownRequested()) return Promise.resolve();
-			this.#shutdown = this.drain().then(() => this.#performShutdown());
+			this.#shutdown = (async () => {
+				const cancellations = this.#cancel();
+				try {
+					await withTimeout(
+						Promise.all([this.drain(), Promise.allSettled(cancellations)]),
+						5_000,
+						"Timed out settling RPC work during shutdown",
+					);
+				} catch (error) {
+					logger.warn("RPC work did not settle during shutdown", { error: String(error) });
+				}
+				await this.#performShutdown();
+			})();
 		}
 		return this.#shutdown;
+	}
+
+	/** Start shutdown only after an extension requests it. */
+	checkShutdownRequested(): Promise<void> {
+		return this.#isShutdownRequested() ? this.shutdown() : Promise.resolve();
 	}
 }
 
@@ -1003,6 +1017,18 @@ export function redactRpcUrlSecrets(value: string): string {
 		for (const [name, nested] of query) {
 			parsed.searchParams.append(name, isRpcSecretFieldName(name) ? RPC_REDACTED_CREDENTIAL : nested);
 		}
+		changed = true;
+	}
+	const fragment = parsed.hash.slice(1);
+	const fragmentParams = new URLSearchParams(fragment);
+	const fragmentEntries = [...fragmentParams];
+	if (fragment.includes("=") && fragmentEntries.some(([name]) => isRpcSecretFieldName(name))) {
+		parsed.hash = "";
+		const redactedFragment = new URLSearchParams();
+		for (const [name, nested] of fragmentEntries) {
+			redactedFragment.append(name, isRpcSecretFieldName(name) ? RPC_REDACTED_CREDENTIAL : nested);
+		}
+		parsed.hash = redactedFragment.toString();
 		changed = true;
 	}
 	if (!changed) return value;
@@ -1905,7 +1931,7 @@ export async function runRpcMode(
 				isRecord(sessionContext.modeData) && typeof sessionContext.modeData.planFilePath === "string"
 					? sessionContext.modeData.planFilePath
 					: undefined;
-			await rpcWorkModes.enterRpcPlanMode(session, planFilePath);
+			await rpcWorkModes.enterRpcPlanModeUnderTransition(session, planFilePath);
 			return;
 		}
 
@@ -1918,7 +1944,7 @@ export async function runRpcMode(
 			session.settings.get("plan.defaultOnStartup") &&
 			session.settings.get("plan.enabled")
 		) {
-			await rpcWorkModes.enterRpcPlanMode(session);
+			await rpcWorkModes.enterRpcPlanModeUnderTransition(session);
 		}
 	};
 	/** Releases attachments owned by the outgoing session after commit. */
@@ -1996,6 +2022,7 @@ export async function runRpcMode(
 		return runRpcSessionTransitionAtCommit(
 			transition,
 			async () => {
+				void rpcMcp.invalidateRpcMCPAuthorizations(session);
 				runtimeSuspension = rpcRuntimeControl.suspendRpcRuntimeControl(session);
 				idleSuspension = idleBehavior.suspend();
 				await session.goalRuntime.onTaskAborted({ reason: "internal" });
@@ -2592,29 +2619,35 @@ export async function runRpcMode(
 				);
 
 			case "approve_plan_proposal": {
-				let executionModel: Model | undefined;
-				if (command.executionModel) {
-					executionModel = await resolveRpcModel(command.executionModel.provider, command.executionModel.modelId);
-					if (!executionModel) {
-						return error(
-							id,
-							"approve_plan_proposal",
-							`Model not found: ${command.executionModel.provider}/${command.executionModel.modelId}`,
-							"model_not_found",
-						);
+				const reservation = rpcWorkModes.reserveRpcPlanApproval(session);
+				try {
+					let executionModel: Model | undefined;
+					if (command.executionModel) {
+						executionModel = await resolveRpcModel(command.executionModel.provider, command.executionModel.modelId);
+						if (!executionModel) {
+							return error(
+								id,
+								"approve_plan_proposal",
+								`Model not found: ${command.executionModel.provider}/${command.executionModel.modelId}`,
+								"model_not_found",
+							);
+						}
 					}
-				}
-				return moduleCommand(id, "approve_plan_proposal", async () =>
-					withRpcPlanDecisionState(
-						await rpcWorkModes.approveRpcPlanProposal(
-							session,
-							command.editedContent,
-							command.strategy,
-							executionModel,
-							command.thinkingLevel,
+					return await moduleCommand(id, "approve_plan_proposal", async () =>
+						withRpcPlanDecisionState(
+							await rpcWorkModes.approveRpcPlanProposal(
+								session,
+								command.editedContent,
+								command.strategy,
+								executionModel,
+								command.thinkingLevel,
+								reservation,
+							),
 						),
-					),
-				);
+					);
+				} finally {
+					reservation.release();
+				}
 			}
 
 			case "reject_plan_proposal":
@@ -3582,27 +3615,42 @@ export async function runRpcMode(
 		return error(unhandled.id, unhandled.type ?? "unknown", `Unknown command: ${unhandled.type}`);
 	};
 
-	// Deferred shutdown (pi.shutdown() from an extension) must not kill the
-	// process while a background-dispatched command still owes the client its
-	// response frame. The coordinator drains tracked tasks before exiting and
-	// re-checks the request as each task settles.
+	const cancelRpcShutdown = (): Promise<void>[] => {
+		pendingExtensionRequests.rejectAll("RPC client disconnected before extension UI response completed");
+		hostToolBridge.close("RPC client disconnected before host tool execution completed");
+		hostUriBridge.clear("RPC client disconnected before host URI request completed");
+		session.abortBash();
+		session.abortEval();
+		rpcBtw.disposeRpcBtw(session);
+		rpcDiagnostics.disposeRpcMcpAuthChallenges(mcpAuthController);
+		subagentRegistry?.dispose();
+		disposeRpcRuntimeBehaviors();
+		rpcWorkModes.disposeRpcWorkModes(session);
+		return [
+			session.abort(),
+			rpcMcp.invalidateRpcMCPAuthorizations(session),
+			releaseVoice(),
+			rpcCollab.disposeRpcCollab(session).catch(error => {
+				logger.error("RPC collaboration teardown failed", { error: String(error) });
+			}),
+		];
+	};
+
 	const shutdownCoordinator = new RpcShutdownCoordinator({
 		isShutdownRequested: () => shutdownState.requested,
+		cancel: cancelRpcShutdown,
 		performShutdown: async () => {
-			// Route through the idempotent session.dispose() so the browser
-			// reaper (releaseTabsForOwner) and other bounded teardown run before
-			// the process exits. dispose() also emits `session_shutdown`, so we
-			// must NOT emit it separately here or the event fires twice. Skipping
-			// dispose left OMP-owned Chromium alive after RPC shutdown (#5643).
+			subagentRegistry?.dispose();
 			unsubscribeSettings();
 			unsubscribeRawSse?.();
 			unsubscribeProviderRequestObservations?.();
 			session.setSessionTransitionCoordinator(null);
-			disposeRpcRuntimeBehaviors();
-			rpcWorkModes.disposeRpcWorkModes(session);
-			await releaseRpcSessionAttachments();
+			try {
+				await withTimeout(inputDispatcher.drain(), 5_000, "Timed out settling serial RPC work during shutdown");
+			} catch (error) {
+				logger.warn("Serial RPC work did not settle during shutdown", { error: String(error) });
+			}
 			await session.dispose();
-			// See the EOF path: queued frames must reach stdout before the process dies.
 			await stdoutQueue;
 			process.exit(0);
 		},
@@ -3644,29 +3692,6 @@ export async function runRpcMode(
 		}
 		inputDispatcher.dispatch(parsed);
 	}
-
-	// stdin closed — RPC client is gone. Fail pending side-channel requests
-	// first so active/queued commands can settle, then drain accepted work.
-	pendingExtensionRequests.rejectAll("RPC client disconnected before extension UI response completed");
-	hostToolBridge.close("RPC client disconnected before host tool execution completed");
-	hostUriBridge.clear("RPC client disconnected before host URI request completed");
-	await inputDispatcher.drain();
-	await shutdownCoordinator.drain();
-	subagentRegistry?.dispose();
-	unsubscribeSettings();
-	unsubscribeRawSse?.();
-	unsubscribeProviderRequestObservations?.();
-	session.setSessionTransitionCoordinator(null);
-	disposeRpcRuntimeBehaviors();
-	rpcWorkModes.disposeRpcWorkModes(session);
-	await releaseRpcSessionAttachments();
-	// Dispose the main session before exiting so the browser reaper and other
-	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a
-	// prior pi.shutdown() through the coordinator makes this await settle
-	// immediately.
-	await session.dispose();
-	// Frames handed to `writeFrames` are only queued; exiting without awaiting the
-	// queue drops already-produced responses and `exec_output` chunks mid-flight.
-	await stdoutQueue;
-	process.exit(0);
+	await shutdownCoordinator.shutdown();
+	return process.exit(0);
 }

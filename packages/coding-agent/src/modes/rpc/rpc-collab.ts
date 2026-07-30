@@ -44,6 +44,7 @@ export class RpcCollabGuestRoutingError extends Error {
 type RpcCollabContext = CollabHostContext &
 	CollabGuestContext & {
 		collabHostStart?: Promise<CollabHost>;
+		collabHostStarting?: CollabHost;
 		collabGuestStart?: Promise<CollabGuestLink>;
 		disposed?: boolean;
 		collabGuestOwnership?: {
@@ -177,6 +178,7 @@ export async function startRpcCollabHosting(
 	if (!urls) throw new Error("No collaboration relay configured");
 
 	const host = new CollabHost(context);
+	context.collabHostStarting = host;
 	const startup = (async () => {
 		try {
 			await host.start(urls.relayUrl, urls.webUrl);
@@ -192,6 +194,7 @@ export async function startRpcCollabHosting(
 		return links(await startup);
 	} finally {
 		if (context.collabHostStart === startup) context.collabHostStart = undefined;
+		if (context.collabHostStarting === host) context.collabHostStarting = undefined;
 	}
 }
 
@@ -302,22 +305,17 @@ export async function leaveRpcCollabSession(session: AgentSession): Promise<void
 	await (await ownedHost(context))?.stop("host stopped");
 }
 
-/** Dispose every collaboration relay owned by this session. No-op when inactive. */
 export async function disposeRpcCollab(session: AgentSession): Promise<void> {
 	const context = contexts.get(session);
 	if (!context) return;
 	context.disposed = true;
-	const guest = await ownedGuest(context);
-	try {
-		await guest?.leave("session ended");
-	} finally {
-		if (!guest?.hasCommittedReplica) {
-			if (guest) releaseGuestOwnership(session, context, guest);
-			try {
-				await (await ownedHost(context))?.stop("session ended");
-			} finally {
-				contexts.delete(session);
-			}
-		}
+	const guest = context.collabGuest ?? context.collabGuestOwnership?.guest;
+	const host = context.collabHost ?? context.collabHostStarting;
+	const leaving = guest?.leave("session ended");
+	const stopping = host?.stop("session ended");
+	await Promise.allSettled([leaving, stopping]);
+	if (!guest?.hasCommittedReplica) {
+		if (guest) releaseGuestOwnership(session, context, guest);
+		contexts.delete(session);
 	}
 }

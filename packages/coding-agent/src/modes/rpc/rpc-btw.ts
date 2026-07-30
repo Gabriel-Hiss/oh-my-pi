@@ -164,3 +164,12 @@ export async function branchRpcBtw(session: AgentSession): Promise<RpcBtwBranchR
 		sessionFile: result.sessionFile ?? null,
 	};
 }
+
+/** Cancel and release the side-question controller when its RPC session ends. */
+export function disposeRpcBtw(session: AgentSession): void {
+	const runtime = runtimes.get(session);
+	if (!runtime) return;
+	cancelPending(runtime.bridge);
+	runtime.controller.dispose();
+	runtimes.delete(session);
+}

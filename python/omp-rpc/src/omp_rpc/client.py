@@ -1214,7 +1214,7 @@ class RpcClient:
         return self._request("get_settings")
 
     def set_setting(self, path: str, value: JsonValue) -> JsonObject:
-        return self._request("set_setting", path=path, value=value)
+        return self._request_with_nulls("set_setting", {"path": path, "value": value})
 
     def get_extensions(self, *, cwd: str | Path | None = None) -> JsonObject:
         return self._request(

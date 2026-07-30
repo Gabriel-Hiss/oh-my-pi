@@ -428,9 +428,9 @@ export function vocalizeRpcSessionEvent(session: AgentSession, event: AgentSessi
 
 /** Releases native audio resources owned by this RPC session. */
 export async function disposeRpcVoice(session: AgentSession): Promise<void> {
-	await stopRpcLive(session);
 	const runtime = runtimes.get(session);
 	runtime?.stt?.controller.dispose();
+	await stopRpcLive(session);
 	vocalizer.unduck();
 	vocalizer.clear();
 	if (enhancerSession === session) {

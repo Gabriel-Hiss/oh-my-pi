@@ -19,6 +19,7 @@ import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-co
 	type: "text",
 };
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import type { SessionTransitionLease } from "../../session/agent-session-types";
 import type { ConfiguredThinkingLevel } from "../../thinking";
 import type { ToolSession } from "../../tools";
 import { normalizeLocalScheme, resolveToCwd } from "../../tools/path-utils";
@@ -135,6 +136,7 @@ interface WorkModeRuntime {
 	planPreviousModel?: PlanModelState;
 	planHasEntered?: boolean;
 	planProposal?: RpcPlanProposalSnapshot;
+	planDecisionInFlight?: boolean;
 	planUnsubscribe?: () => void;
 	goalPreviousTools?: string[];
 	goalUnsubscribe?: () => void;
@@ -181,6 +183,60 @@ function runtimeFor(session: AgentSession): WorkModeRuntime {
 		runtimes.set(session, runtime);
 	}
 	return runtime;
+}
+
+function acquireRpcPlanDecision(session: AgentSession): () => void {
+	const runtime = runtimeFor(session);
+	if (runtime.planDecisionInFlight) throw new Error("A plan decision is already in progress.");
+	runtime.planDecisionInFlight = true;
+	return () => {
+		runtime.planDecisionInFlight = false;
+	};
+}
+
+export interface RpcPlanApprovalReservation {
+	proposal: RpcPlanProposalSnapshot;
+	transitionLease: SessionTransitionLease;
+	release(): void;
+}
+
+
+async function runRpcPlanMutation<T>(session: AgentSession, operation: () => Promise<T>): Promise<T> {
+	const releaseDecision = acquireRpcPlanDecision(session);
+	let transitionLease: SessionTransitionLease | undefined;
+	try {
+		transitionLease = session.acquireSessionTransition();
+		return await operation();
+	} finally {
+		transitionLease?.release();
+		releaseDecision();
+	}
+}
+
+/** Reserve a proposal decision before any asynchronous handler preparation. */
+export function reserveRpcPlanApproval(session: AgentSession): RpcPlanApprovalReservation {
+	const releaseDecision = acquireRpcPlanDecision(session);
+	let transitionLease: SessionTransitionLease | undefined;
+	try {
+		const proposal = runtimeFor(session).planProposal;
+		if (!proposal) throw new Error("No plan proposal is pending.");
+		transitionLease = session.acquireSessionTransition();
+		let released = false;
+		return {
+			proposal,
+			transitionLease,
+			release: () => {
+				if (released) return;
+				released = true;
+				transitionLease?.release();
+				releaseDecision();
+			},
+		};
+	} catch (error) {
+		transitionLease?.release();
+		releaseDecision();
+		throw error;
+	}
 }
 function localProtocolOptions(session: AgentSession): LocalProtocolOptions {
 	return {
@@ -322,11 +378,13 @@ function installPlanProposalHandler(session: AgentSession): void {
 			.catch(error => logger.warn("Failed to pause plan proposal turn", { error: String(error) }))
 			.finally(() => session.clearPlanInternalAbortPending());
 	});
-	session.setPlanProposalHandler(async title => {
-		const prepared = await session.preparePlanForReview(title);
-		await stagePreparedPlanProposal(session, prepared);
-		return prepared;
-	});
+	session.setPlanProposalHandler(async title =>
+		runRpcPlanMutation(session, async () => {
+			const prepared = await session.preparePlanForReview(title);
+			await stagePreparedPlanProposal(session, prepared);
+			return prepared;
+		}),
+	);
 }
 
 async function restorePlanModel(session: AgentSession, previous: PlanModelState): Promise<void> {
@@ -531,7 +589,7 @@ function startRpcGoalTurn(session: AgentSession, objective: string): void {
 	});
 }
 
-export async function enterRpcPlanMode(
+async function enterRpcPlanModeLocked(
 	session: AgentSession,
 	planFilePath?: string,
 	workflow: "parallel" | "iterative" = "parallel",
@@ -585,6 +643,17 @@ export async function enterRpcPlanMode(
 	return clonePlanSnapshot(session);
 }
 
+/** Re-enters plan mode while the caller already owns the session transition. */
+export const enterRpcPlanModeUnderTransition = enterRpcPlanModeLocked;
+
+export async function enterRpcPlanMode(
+	session: AgentSession,
+	planFilePath?: string,
+	workflow: "parallel" | "iterative" = "parallel",
+): Promise<RpcPlanModeSnapshot> {
+	return runRpcPlanMutation(session, () => enterRpcPlanModeLocked(session, planFilePath, workflow));
+}
+
 async function leaveRpcPlanMode(session: AgentSession, deferModelRestore: boolean): Promise<RpcPlanModeSnapshot> {
 	const state = session.getPlanModeState();
 	if (!state?.enabled) return clonePlanSnapshot(session);
@@ -626,19 +695,27 @@ async function leaveRpcPlanMode(session: AgentSession, deferModelRestore: boolea
 	return clonePlanSnapshot(session);
 }
 
-export async function exitRpcPlanMode(session: AgentSession): Promise<RpcPlanModeSnapshot> {
+async function exitRpcPlanModeLocked(session: AgentSession): Promise<RpcPlanModeSnapshot> {
 	return leaveRpcPlanMode(session, false);
+}
+
+export async function exitRpcPlanMode(session: AgentSession): Promise<RpcPlanModeSnapshot> {
+	return runRpcPlanMutation(session, () => exitRpcPlanModeLocked(session));
 }
 
 export async function readRpcPlanModeState(session: AgentSession): Promise<RpcPlanModeSnapshot> {
 	return clonePlanSnapshot(session);
 }
 
-export async function submitRpcPlanReview(session: AgentSession, title = ""): Promise<RpcPlanProposalSnapshot> {
+async function submitRpcPlanReviewLocked(session: AgentSession, title = ""): Promise<RpcPlanProposalSnapshot> {
 	if (!session.getPlanModeState()?.enabled) throw new Error("Plan mode is not active.");
 	await abortPlanTurn(session);
 	const prepared = await session.preparePlanForReview(title);
 	return stagePreparedPlanProposal(session, prepared);
+}
+
+export async function submitRpcPlanReview(session: AgentSession, title = ""): Promise<RpcPlanProposalSnapshot> {
+	return runRpcPlanMutation(session, () => submitRpcPlanReviewLocked(session, title));
 }
 
 export async function approveRpcPlanProposal(
@@ -647,14 +724,39 @@ export async function approveRpcPlanProposal(
 	strategy: RpcPlanFinalizationStrategy = "keep-context",
 	executionModel?: Model,
 	thinkingLevel?: ConfiguredThinkingLevel,
+	reservation?: RpcPlanApprovalReservation,
 ): Promise<RpcPlanDecisionResult> {
-	const runtime = runtimeFor(session);
-	const proposal = runtime.planProposal;
-	if (!proposal) throw new Error("No plan proposal is pending.");
 	if (strategy !== "execute" && strategy !== "keep-context" && strategy !== "compact-context") {
 		throw new Error(`Unknown plan finalization strategy: ${String(strategy)}`);
 	}
 	if (strategy === "execute") assertRpcSessionTransitionAllowed(session);
+	const ownedReservation = reservation ?? reserveRpcPlanApproval(session);
+	try {
+		return await approveRpcPlanProposalLocked(
+			session,
+			editedContent,
+			strategy,
+			executionModel,
+			thinkingLevel,
+			ownedReservation.transitionLease,
+			ownedReservation.proposal,
+		);
+	} finally {
+		if (!reservation) ownedReservation.release();
+	}
+}
+
+async function approveRpcPlanProposalLocked(
+	session: AgentSession,
+	editedContent: string | undefined,
+	strategy: RpcPlanFinalizationStrategy,
+	executionModel: Model | undefined,
+	thinkingLevel: ConfiguredThinkingLevel | undefined,
+	transitionLease: SessionTransitionLease,
+	proposal: RpcPlanProposalSnapshot,
+): Promise<RpcPlanDecisionResult> {
+	const runtime = runtimeFor(session);
+	if (runtime.planProposal !== proposal) throw new Error("The pending plan proposal changed before approval.");
 
 	const planContent =
 		editedContent ??
@@ -677,7 +779,7 @@ export async function approveRpcPlanProposal(
 	try {
 		if (strategy === "execute") {
 			const sourceRoot = resolveLocalUrlToPath("local://", localProtocolOptions(session));
-			const created = await session.runSessionTransition(async transitionOptions => {
+			const created = await transitionLease.run(async transitionOptions => {
 				const didCreate = await session.newSession(transitionOptions);
 				return {
 					result: didCreate,
@@ -766,6 +868,10 @@ export async function approveRpcPlanProposal(
 }
 
 export async function rejectRpcPlanProposal(session: AgentSession, feedback = ""): Promise<RpcPlanDecisionResult> {
+	return runRpcPlanMutation(session, () => rejectRpcPlanProposalLocked(session, feedback));
+}
+
+async function rejectRpcPlanProposalLocked(session: AgentSession, feedback = ""): Promise<RpcPlanDecisionResult> {
 	const runtime = runtimeFor(session);
 	const proposal = runtime.planProposal;
 	if (!proposal) throw new Error("No plan proposal is pending.");
