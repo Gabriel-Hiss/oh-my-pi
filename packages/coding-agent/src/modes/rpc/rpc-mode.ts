@@ -2416,15 +2416,14 @@ export async function runRpcMode(
 				if (guestBlock) {
 					return error(id, command.type, guestBlock.message, guestBlock.code);
 				}
-				let sameSessionReload = false;
 				let resolvedCommand: RpcSessionChangeCommand = command;
+				let switchSessionPath: string | undefined;
 				if (command.type === "switch_session") {
-					const sessionPath = await resolveRpcSessionReference(command.sessionPath);
-					if (!sessionPath) {
+					switchSessionPath = await resolveRpcSessionReference(command.sessionPath);
+					if (!switchSessionPath) {
 						return error(id, "switch_session", `Session "${command.sessionPath}" not found`, "unknown_session");
 					}
-					sameSessionReload = isSameRpcSessionReload(session.sessionFile, sessionPath);
-					resolvedCommand = { ...command, sessionPath };
+					resolvedCommand = { ...command, sessionPath: switchSessionPath };
 				}
 				const result = await runReconciledRpcSessionTransition(
 					async transitionOptions => {
@@ -2441,10 +2440,16 @@ export async function runRpcMode(
 							honorPlanDefault: command.type === "new_session" && committed,
 						};
 					},
-					{
-						honorPlanDefaultOnCommit: command.type === "new_session",
-						preserveCurrentSessionOnSuccess: sameSessionReload,
-					},
+					command.type === "switch_session"
+						? {
+								get preserveCurrentSessionOnSuccess() {
+									return (
+										switchSessionPath !== undefined &&
+										isSameRpcSessionReload(session.sessionFile, switchSessionPath)
+									);
+								},
+							}
+						: { honorPlanDefaultOnCommit: command.type === "new_session" },
 				);
 				if (!result.data.cancelled) await emitAvailableCommandsUpdate();
 				return success(id, result.type, result.data);
@@ -3168,49 +3173,50 @@ export async function runRpcMode(
 
 			case "delete_session": {
 				const target = path.resolve(command.sessionPath);
-				const activeSessionFile = session.sessionManager.getSessionFile();
-				const active = activeSessionFile !== undefined && target === path.resolve(activeSessionFile);
-				if (active) {
-					const guestBlock = getRpcSessionTransitionGuestBlock(session);
-					if (guestBlock) {
-						return error(id, "delete_session", guestBlock.message, guestBlock.code);
-					}
-					try {
-						if (session.isCompacting) {
-							session.abortCompaction();
-							while (session.isCompacting) await Bun.sleep(10);
-						}
-						const deleted = await runReconciledRpcSessionTransition(
-							async transitionOptions => {
-								const created = await session.newSession({ drop: true, ...transitionOptions });
-								if (created) subagentRegistry?.clear();
-								return { result: created, committed: created, honorPlanDefault: created };
-							},
-							{ honorPlanDefaultOnCommit: true },
-						);
-						if (!deleted) {
-							return error(id, "delete_session", "Session deletion was cancelled", "cancelled");
-						}
-						await emitAvailableCommandsUpdate();
-						return success(id, "delete_session", { sessionPath: command.sessionPath });
-					} catch (err) {
-						return error(id, "delete_session", err instanceof Error ? err.message : String(err));
-					}
-				}
-				// `deleteSessionWithArtifacts` unlinks the file and recursively removes the
-				// sibling artifacts directory derived from its name, so an arbitrary path is a
-				// destructive primitive. Only accept a path the session listing actually owns.
-				const known = (await SessionManager.listAll()).some(item => path.resolve(item.path) === target);
-				if (!known) {
-					return error(
-						id,
-						"delete_session",
-						`Not a known session file: ${command.sessionPath}`,
-						"unknown_session",
-					);
-				}
 				try {
-					await new FileSessionStorage().deleteSessionWithArtifacts(command.sessionPath);
+					const deleted = await runReconciledRpcSessionTransition(async transitionOptions => {
+						const activeSessionFile = session.sessionManager.getSessionFile();
+						if (activeSessionFile !== undefined && target === path.resolve(activeSessionFile)) {
+							if (session.isCompacting) {
+								session.abortCompaction();
+								while (session.isCompacting) await Bun.sleep(10);
+							}
+							const created = await session.newSession({ drop: true, ...transitionOptions });
+							if (created) subagentRegistry?.clear();
+							return {
+								result: { deleted: created, known: true },
+								committed: created,
+								honorPlanDefault: created,
+							};
+						}
+
+						const known = (await SessionManager.listAll()).some(item => path.resolve(item.path) === target);
+						if (!known) {
+							return {
+								result: { deleted: false, known: false },
+								committed: false,
+								honorPlanDefault: false,
+							};
+						}
+						await new FileSessionStorage().deleteSessionWithArtifacts(target);
+						return {
+							result: { deleted: true, known: true },
+							committed: false,
+							honorPlanDefault: false,
+						};
+					}, { honorPlanDefaultOnCommit: true });
+					if (!deleted.known) {
+						return error(
+							id,
+							"delete_session",
+							`Not a known session file: ${command.sessionPath}`,
+							"unknown_session",
+						);
+					}
+					if (!deleted.deleted) {
+						return error(id, "delete_session", "Session deletion was cancelled", "cancelled");
+					}
+					await emitAvailableCommandsUpdate();
 					return success(id, "delete_session", { sessionPath: command.sessionPath });
 				} catch (err) {
 					return error(id, "delete_session", err instanceof Error ? err.message : String(err));
@@ -3228,8 +3234,8 @@ export async function runRpcMode(
 			}
 
 			case "navigate_tree": {
-				const previousLeafId = session.sessionManager.getLeafId();
 				const result = await session.runSessionTransition(async transitionOptions => {
+					const previousLeafId = session.sessionManager.getLeafId();
 					const navigation = await session.navigateTree(
 						command.targetId,
 						{

@@ -755,6 +755,33 @@ export async function approveRpcPlanProposal(
 	}
 }
 
+function dispatchRpcPlanTurn(session: AgentSession, text: string, synthetic: boolean): Promise<void> {
+	const dispatched = Promise.withResolvers<void>();
+	let accepted = false;
+	const onDispatchAccepted = (): void => {
+		accepted = true;
+		dispatched.resolve();
+	};
+	const completion = session.isStreaming
+		? session.followUp(text, undefined, { synthetic, onDispatchAccepted })
+		: session.prompt(text, { synthetic, onDispatchAccepted });
+	void completion.then(
+		() => {
+			if (!accepted) dispatched.reject(new Error("Plan turn dispatch was not accepted."));
+		},
+		error => {
+			if (!accepted) {
+				dispatched.reject(error);
+				return;
+			}
+			logger.warn("RPC plan turn failed after dispatch", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		},
+	);
+	return dispatched.promise;
+}
+
 async function approveRpcPlanProposalLocked(
 	session: AgentSession,
 	editedContent: string | undefined,
@@ -851,20 +878,8 @@ async function approveRpcPlanProposalLocked(
 			planFilePath: proposal.planFilePath,
 			contextPreserved: strategy !== "execute",
 		});
+		await dispatchRpcPlanTurn(session, executionPrompt, true);
 		reservation.release();
-		if (session.isStreaming) {
-			void session.followUp(executionPrompt, undefined, { synthetic: true }).catch(error => {
-				logger.warn("Failed to start RPC plan execution turn", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			});
-		} else {
-			void session.prompt(executionPrompt, { synthetic: true }).catch(error => {
-				logger.warn("Failed to start RPC plan execution turn", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			});
-		}
 	}
 
 	return {
@@ -898,14 +913,8 @@ async function rejectRpcPlanProposalLocked(
 	await abortPlanTurn(session);
 	runtime.planProposal = undefined;
 	const refinement = feedback.trim();
+	if (refinement) await dispatchRpcPlanTurn(session, refinement, false);
 	release();
-	if (refinement) {
-		void session.prompt(refinement).catch(error => {
-			logger.warn("Failed to start RPC plan refinement turn", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-		});
-	}
 	return {
 		decision: "rejected",
 		planFilePath: proposal.planFilePath,

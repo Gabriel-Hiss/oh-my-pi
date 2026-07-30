@@ -80,7 +80,10 @@ function createPlanSession(options?: { cwd?: string; proposalPath?: string }) {
 	let nextModelRestoreError: Error | undefined;
 	let planModeState: PlanModeState | undefined;
 	let planProposalHandler: PlanProposalHandler | undefined;
-	let prompt: (text: string) => Promise<void> = async () => {};
+	let prompt: (text: string, options?: { onDispatchAccepted?: () => void }) => Promise<void> = async (
+		_text,
+		options,
+	) => options?.onDispatchAccepted?.();
 	const newSession = vi.fn(async () => true);
 	let transitionRunner: SessionTransitionRunner = async transition => (await transition({})).result;
 	const runSessionTransition: SessionTransitionRunner = (transition, transitionOptions) =>
@@ -117,8 +120,10 @@ function createPlanSession(options?: { cwd?: string; proposalPath?: string }) {
 		setPlanProposalHandler: (handler: PlanProposalHandler | null) => {
 			planProposalHandler = handler ?? undefined;
 		},
-		prompt: (text: string) => prompt(text),
-		followUp: async () => {},
+		prompt: (text: string, options?: { onDispatchAccepted?: () => void }) => prompt(text, options),
+		followUp: async (_text: string, _images?: unknown, options?: { onDispatchAccepted?: () => void }) => {
+			options?.onDispatchAccepted?.();
+		},
 		preparePlanForReview: async (title: string) => ({
 			details: {
 				planFilePath: options?.proposalPath ?? "local://PLAN.md",
@@ -168,7 +173,7 @@ function createPlanSession(options?: { cwd?: string; proposalPath?: string }) {
 		failNextModelRestore: (error: Error) => {
 			nextModelRestoreError = error;
 		},
-		setPrompt: (next: (text: string) => Promise<void>) => {
+		setPrompt: (next: (text: string, options?: { onDispatchAccepted?: () => void }) => Promise<void>) => {
 			prompt = next;
 		},
 		setTransitionRunner: (runner: SessionTransitionRunner) => {
@@ -405,7 +410,9 @@ describe("RPC plan proposal guest guard", () => {
 			await Bun.write(planPath, "# Compact failure plan\n");
 			const plan = createPlanSession({ cwd: tempDir.path(), proposalPath: planPath });
 			const executionModel = { id: "execution-model", provider: "test" } as unknown as Model;
-			const prompts = vi.fn(async () => {});
+			const prompts = vi.fn(async (_text: string, options?: { onDispatchAccepted?: () => void }) => {
+				options?.onDispatchAccepted?.();
+			});
 			Object.assign(plan.session, {
 				compact: async () => {
 					throw new Error("compaction failed");
@@ -431,7 +438,7 @@ describe("RPC plan proposal guest guard", () => {
 		}
 	});
 
-	test("holds plan decisions through execution preparation, then releases before the turn completes", async () => {
+	test("holds approval through directive registration, then ACKs before the unresolved turn completes", async () => {
 		const tempDir = TempDir.createSync("@pi-rpc-plan-decision-");
 		try {
 			const planPath = tempDir.join("PLAN.md");
@@ -440,32 +447,37 @@ describe("RPC plan proposal guest guard", () => {
 			await enterRpcPlanMode(plan.session);
 			await submitRpcPlanReview(plan.session, "Exclusive decision");
 			const created = Promise.withResolvers<boolean>();
-			const turnStarted = Promise.withResolvers<void>();
+			const normalizing = Promise.withResolvers<void>();
+			const allowRegistration = Promise.withResolvers<void>();
+			const registered = Promise.withResolvers<void>();
 			const releaseTurn = Promise.withResolvers<void>();
+			const acknowledged = Promise.withResolvers<void>();
 			plan.newSession.mockImplementation(async () => await created.promise);
-			plan.setPrompt(async () => {
-				turnStarted.resolve();
+			plan.setPrompt(async (_text, options) => {
+				normalizing.resolve();
+				await allowRegistration.promise;
+				options?.onDispatchAccepted?.();
+				registered.resolve();
 				await releaseTurn.promise;
 			});
 
 			const approving = approveRpcPlanProposal(plan.session, undefined, "execute");
-			let acknowledged = false;
-			void approving.then(() => {
-				acknowledged = true;
-			});
+			void approving.then(() => acknowledged.resolve());
 
 			expect(() => plan.session.acquireSessionTransition()).toThrow(
 				"Another RPC session transition is already in progress.",
 			);
-			await expect(rejectRpcPlanProposal(plan.session)).rejects.toThrow("A plan decision is already in progress.");
-
 			created.resolve(true);
-			await turnStarted.promise;
-			await new Promise<void>(resolve => setImmediate(resolve));
-			expect(acknowledged).toBe(true);
+			await normalizing.promise;
+			expect(() => plan.session.acquireSessionTransition()).toThrow(
+				"Another RPC session transition is already in progress.",
+			);
+
+			allowRegistration.resolve();
+			await registered.promise;
+			await acknowledged.promise;
 			const lease = plan.session.acquireSessionTransition();
 			lease.release();
-			await expect(rejectRpcPlanProposal(plan.session)).resolves.toMatchObject({ decision: "rejected" });
 			releaseTurn.resolve();
 			await expect(approving).resolves.toMatchObject({ decision: "approved" });
 		} finally {
@@ -499,7 +511,7 @@ describe("RPC plan proposal guest guard", () => {
 		}
 	});
 
-	test("releases the plan mutation before an unresolved refinement turn completes", async () => {
+	test("holds rejection through refinement registration, then ACKs before the unresolved turn completes", async () => {
 		const tempDir = TempDir.createSync("@pi-rpc-plan-reject-");
 		try {
 			const planPath = tempDir.join("PLAN.md");
@@ -507,21 +519,29 @@ describe("RPC plan proposal guest guard", () => {
 			const plan = createPlanSession({ cwd: tempDir.path(), proposalPath: planPath });
 			await enterRpcPlanMode(plan.session);
 			await submitRpcPlanReview(plan.session, "Rejection plan");
-			const refinementStarted = Promise.withResolvers<void>();
+			const normalizing = Promise.withResolvers<void>();
+			const allowRegistration = Promise.withResolvers<void>();
+			const registered = Promise.withResolvers<void>();
 			const releaseRefinement = Promise.withResolvers<void>();
-			plan.setPrompt(async () => {
-				refinementStarted.resolve();
+			const acknowledged = Promise.withResolvers<void>();
+			plan.setPrompt(async (_text, options) => {
+				normalizing.resolve();
+				await allowRegistration.promise;
+				options?.onDispatchAccepted?.();
+				registered.resolve();
 				await releaseRefinement.promise;
 			});
 
 			const rejecting = rejectRpcPlanProposal(plan.session, "Revise the plan");
-			let acknowledged = false;
-			void rejecting.then(() => {
-				acknowledged = true;
-			});
-			await refinementStarted.promise;
-			await new Promise<void>(resolve => setImmediate(resolve));
-			expect(acknowledged).toBe(true);
+			void rejecting.then(() => acknowledged.resolve());
+			await normalizing.promise;
+			expect(() => plan.session.acquireSessionTransition()).toThrow(
+				"Another RPC session transition is already in progress.",
+			);
+
+			allowRegistration.resolve();
+			await registered.promise;
+			await acknowledged.promise;
 			const lease = plan.session.acquireSessionTransition();
 			lease.release();
 			releaseRefinement.resolve();

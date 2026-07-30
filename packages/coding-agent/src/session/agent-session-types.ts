@@ -241,6 +241,8 @@ export interface PromptOptions {
 	attribution?: MessageAttribution;
 	/** Skip pre-send compaction checks for this prompt. */
 	skipCompactionCheck?: boolean;
+	/** Runs once the prompt has been handed to the agent. */
+	onDispatchAccepted?: () => void;
 }
 
 /** Options for AgentSession.followUp(). */
@@ -251,6 +253,8 @@ export interface FollowUpOptions {
 	expandPromptTemplates?: boolean;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Runs once the follow-up has been enqueued. */
+	onDispatchAccepted?: () => void;
 }
 
 /** Result from a handoff operation. */

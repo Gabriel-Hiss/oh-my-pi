@@ -165,22 +165,24 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						};
 					},
 					{
-						preserveCurrentSessionOnSuccess:
-							session.sessionFile !== undefined &&
-							normalizePathForComparison(session.sessionFile) === normalizePathForComparison(sessionPath),
+						get preserveCurrentSessionOnSuccess() {
+							return (
+								session.sessionFile !== undefined &&
+								normalizePathForComparison(session.sessionFile) === normalizePathForComparison(sessionPath)
+							);
+						},
 					},
 				),
-			reload: async () => {
-				const sessionFile = session.sessionFile;
-				if (!sessionFile) return;
-				await session.runSessionTransition(
+			reload: async () =>
+				session.runSessionTransition(
 					async transitionOptions => {
+						const sessionFile = session.sessionFile;
+						if (!sessionFile) return { result: undefined, committed: false, honorPlanDefault: false };
 						const switched = await session.switchSession(sessionFile, transitionOptions);
 						return { result: undefined, committed: switched, honorPlanDefault: false };
 					},
 					{ preserveCurrentSessionOnSuccess: true },
-				);
-			},
+				),
 			compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
 		},
 		uiContext,

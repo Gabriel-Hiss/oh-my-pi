@@ -4847,6 +4847,7 @@ export class AgentSession {
 			} else {
 				await this.#queueUserMessage(expandedText, options?.images, "steer");
 			}
+			options?.onDispatchAccepted?.();
 			return true;
 		}
 
@@ -4968,7 +4969,7 @@ export class AgentSession {
 	async #promptWithMessage(
 		message: AgentMessage,
 		expandedText: string,
-		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck"> & {
+		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck" | "onDispatchAccepted"> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
@@ -5174,7 +5175,7 @@ export class AgentSession {
 				this.#planReferenceSent = true;
 			}
 			try {
-				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
+				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions, options?.onDispatchAccepted);
 			} finally {
 				this.#stats.setPendingSnapshot(undefined);
 			}
@@ -5367,6 +5368,7 @@ export class AgentSession {
 		if (!(await this.#runUsageAwarePreflight())) return;
 		if (!options?.synthetic) {
 			await this.#queueUserMessage(expandedText, images, "followUp");
+			options?.onDispatchAccepted?.();
 			return;
 		}
 		// Synthetic branch: agent-initiated hidden developer message. Bypass
@@ -5389,6 +5391,7 @@ export class AgentSession {
 			timestamp: Date.now(),
 		});
 		this.#scheduleIdleQueueDrain();
+		options?.onDispatchAccepted?.();
 	}
 
 	async #queueUserMessage(
