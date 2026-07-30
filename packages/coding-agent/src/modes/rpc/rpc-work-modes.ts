@@ -821,14 +821,12 @@ async function approveRpcPlanProposalLocked(
 	await session.setActiveToolsByName(previousTools.includes("read") ? previousTools : [...previousTools, "read"]);
 	session.setPlanReferencePath(proposal.planFilePath);
 	if (compactBeforeExecute) {
-		if (compactOutcome !== "failed") {
-			const previousModel = runtime.planPreviousModel;
-			runtime.planPreviousModel = undefined;
-			if (executionModel || thinkingLevel !== undefined) {
-				await applyPlanExecutionModel(session, executionModel, thinkingLevel);
-			} else if (previousModel) {
-				await restorePlanModel(session, previousModel);
-			}
+		const previousModel = runtime.planPreviousModel;
+		runtime.planPreviousModel = undefined;
+		if (executionModel || thinkingLevel !== undefined) {
+			await applyPlanExecutionModel(session, executionModel, thinkingLevel);
+		} else if (previousModel) {
+			await restorePlanModel(session, previousModel);
 		}
 	} else {
 		await applyPlanExecutionModel(session, executionModel, thinkingLevel);

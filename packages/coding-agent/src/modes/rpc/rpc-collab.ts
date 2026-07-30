@@ -115,15 +115,6 @@ async function ownedHost(context: RpcCollabContext | undefined): Promise<CollabH
 	}
 }
 
-async function ownedGuest(context: RpcCollabContext | undefined): Promise<CollabGuestLink | undefined> {
-	if (!context) return undefined;
-	if (context.collabGuest) return context.collabGuest;
-	try {
-		return await context.collabGuestStart;
-	} catch {
-		return undefined;
-	}
-}
 
 /** Release the transition lease only after a failed join no longer owns a committed replica. */
 function releaseGuestOwnership(session: AgentSession, context: RpcCollabContext, guest: CollabGuestLink): void {
@@ -138,6 +129,12 @@ function releaseGuestOwnership(session: AgentSession, context: RpcCollabContext,
 /** Whether this session is currently a collaboration guest replica. */
 export function isRpcCollabGuest(session: AgentSession): boolean {
 	return contexts.get(session)?.collabGuest !== undefined;
+}
+
+/** Whether this session owns a collaboration guest startup that has not joined yet. */
+export function isRpcCollabGuestJoining(session: AgentSession): boolean {
+	const context = contexts.get(session);
+	return context?.collabGuest === undefined && context?.collabGuestOwnership !== undefined;
 }
 
 /** How guest input relates to the authoritative host's logical agent lifecycle. */
@@ -290,7 +287,12 @@ export async function joinRpcCollabSession(
 /** Leave a guest session, or stop hosting when called by the current host. */
 export async function leaveRpcCollabSession(session: AgentSession): Promise<void> {
 	const context = contexts.get(session);
-	const guest = await ownedGuest(context);
+	let guest = context?.collabGuest ?? context?.collabGuestOwnership?.guest;
+	if (!guest && context?.collabGuestStart) {
+		try {
+			guest = await context.collabGuestStart;
+		} catch {}
+	}
 	if (guest) {
 		try {
 			await guest.leave("left");

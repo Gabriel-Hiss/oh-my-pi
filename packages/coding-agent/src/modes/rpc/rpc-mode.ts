@@ -2107,7 +2107,16 @@ export async function runRpcMode(
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
-		if (rpcCollab.isRpcCollabGuest(session) && RPC_COLLAB_GUEST_COMMAND_POLICY[command.type] === "block") {
+		const collabGuest = rpcCollab.isRpcCollabGuest(session);
+		const collabGuestJoining = rpcCollab.isRpcCollabGuestJoining(session);
+		const guestStartupTransition =
+			collabGuestJoining &&
+			(command.type === "join_collab_session" || command.type === "new_session" || command.type === "switch_session");
+		if (
+			!guestStartupTransition &&
+			(collabGuest || collabGuestJoining) &&
+			RPC_COLLAB_GUEST_COMMAND_POLICY[command.type] === "block"
+		) {
 			return error(
 				id,
 				command.type,

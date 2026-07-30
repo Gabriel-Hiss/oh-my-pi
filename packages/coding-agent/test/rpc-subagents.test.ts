@@ -11,6 +11,7 @@ import type {
 import { askRpcBtw, branchRpcBtw, cancelRpcBtw } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-btw";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import * as rpcCollab from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-collab";
+import * as rpcMcp from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mcp";
 import {
 	handleRpcSessionChange,
 	isSameRpcSessionReload,
@@ -430,6 +431,34 @@ describe("RPC session transition boundaries", () => {
 				vi.restoreAllMocks();
 			}
 		}
+	});
+
+	test("blocks credential mutation and leaves while collab startup awaits welcome", async () => {
+		const startupGate = Promise.withResolvers<void>();
+		const leaveCalled = Promise.withResolvers<void>();
+		const fixture = createRpcModeSession();
+		const leave = vi.spyOn(CollabGuestLink.prototype, "leave").mockImplementation(async () => {
+			leaveCalled.resolve();
+		});
+		vi.spyOn(CollabGuestLink.prototype, "join").mockImplementation(async () => {
+			await startupGate.promise;
+		});
+		const unauth = vi.spyOn(rpcMcp, "unauthRpcMCPServer");
+		const frames = captureRpcFrames();
+		const commands = [
+			{ id: "join", type: "join_collab_session", link: "wss://relay.invalid/pending" },
+			{ id: "unauth", type: "mcp_unauth_server", name: "demo" },
+			{ id: "leave", type: "leave_collab_session" },
+		] satisfies RpcCommand[];
+
+		const running = runRpcMode(fixture.session, undefined, undefined, rpcInput(commands));
+		await leaveCalled.promise;
+		expect(unauth).not.toHaveBeenCalled();
+
+		startupGate.resolve();
+		await running;
+		expect(leave).toHaveBeenCalledWith("left");
+		expect(observedResponse(frames, "unauth")).toMatchObject({ success: false, code: "operation_failed" });
 	});
 
 	test("reserves join before relay startup so every concurrent transition reports session_busy", async () => {

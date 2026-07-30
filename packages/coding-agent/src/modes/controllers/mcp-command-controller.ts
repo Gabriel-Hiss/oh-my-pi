@@ -213,6 +213,8 @@ export interface OAuthFlowResult {
 	resource?: string;
 }
 
+const deferredOAuthCredentials = new WeakMap<OAuthFlowResult, MCPStoredOAuthCredential>();
+
 /**
  * Thrown by {@link MCPCommandController}'s OAuth handler when the user (or a
  * caller-supplied {@link AbortSignal}) cancels the in-flight flow. Distinct
@@ -282,11 +284,12 @@ export interface MCPAuthorizationCallbacks {
 	signal?: AbortSignal;
 }
 
-/** Run and persist an MCP OAuth flow without choosing how authorization UI is rendered. */
+/** Run an MCP OAuth flow, persisting its credential unless persistence is deferred. */
 export async function authorizeMCP(
 	session: AgentSession,
 	request: MCPAuthorizationRequest,
 	callbacks: MCPAuthorizationCallbacks,
+	persistCredential = true,
 ): Promise<OAuthFlowResult> {
 	let parsedAuthorizationUrl: URL;
 	try {
@@ -331,12 +334,17 @@ export async function authorizeMCP(
 		resource: flow.resource,
 		authorizationUrl: flow.authorizationUrl,
 	};
-	await session.modelRegistry.authStorage.set(credentialId, oauthCredential);
-	return {
+	const result = {
 		credentialId,
 		clientId: flow.resolvedClientId,
 		resource: flow.resource,
 	};
+	if (persistCredential) {
+		await session.modelRegistry.authStorage.set(credentialId, oauthCredential);
+	} else {
+		deferredOAuthCredentials.set(result, oauthCredential);
+	}
+	return result;
 }
 
 function requireMCPManager(ctx: MCPRuntimeCommandContext): MCPManager {
@@ -622,16 +630,38 @@ export async function completeMCPReauth(
 				stripSameOriginResource: plan.oauthResourceIsFallback,
 			})
 		: plan.baseConfig;
-	if (plan.found.discovered) {
-		const current = ctx.mcpManager?.getServerConfig(plan.name);
-		if (!current || !Bun.deepEquals(current, plan.found.config)) {
-			throw new Error(`MCP reauthorization expired because server "${plan.name}" changed or was removed.`);
-		}
-		if (shouldPersist) await updateMCPServer(plan.found.filePath, plan.name, updatedConfig);
-	} else {
-		await updateExistingMCPServer(plan.found.filePath, plan.name, plan.found.config, updatedConfig);
-	}
 	const authStorage = ctx.session.modelRegistry.authStorage;
+	const deferredCredential = deferredOAuthCredentials.get(result);
+	const previousCredential = deferredCredential ? authStorage.get(result.credentialId) : undefined;
+	let persistedCredential = false;
+	const persistCredential = async (): Promise<void> => {
+		if (!deferredCredential) return;
+		await authStorage.set(result.credentialId, deferredCredential);
+		persistedCredential = true;
+	};
+	try {
+		if (plan.found.discovered) {
+			const current = ctx.mcpManager?.getServerConfig(plan.name);
+			if (!current || !Bun.deepEquals(current, plan.found.config)) {
+				throw new Error(`MCP reauthorization expired because server "${plan.name}" changed or was removed.`);
+			}
+			await persistCredential();
+			if (shouldPersist) await updateMCPServer(plan.found.filePath, plan.name, updatedConfig);
+		} else {
+			await updateExistingMCPServer(plan.found.filePath, plan.name, plan.found.config, updatedConfig, persistCredential);
+		}
+	} catch (error) {
+		if (persistedCredential) {
+			if (previousCredential) {
+				await authStorage.set(result.credentialId, previousCredential);
+			} else {
+				await authStorage.remove(result.credentialId);
+			}
+		}
+		throw error;
+	} finally {
+		deferredOAuthCredentials.delete(result);
+	}
 	if (
 		plan.currentAuth?.type === "oauth" &&
 		plan.currentAuth.credentialId &&

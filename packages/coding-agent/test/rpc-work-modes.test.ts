@@ -398,6 +398,39 @@ describe("RPC plan proposal guest guard", () => {
 		}
 	});
 
+	test("restores execution model after compact-context failure and exits plan mode", async () => {
+		const tempDir = TempDir.createSync("@pi-rpc-plan-compact-failure-");
+		try {
+			const planPath = tempDir.join("PLAN.md");
+			await Bun.write(planPath, "# Compact failure plan\n");
+			const plan = createPlanSession({ cwd: tempDir.path(), proposalPath: planPath });
+			const executionModel = { id: "execution-model", provider: "test" } as unknown as Model;
+			const prompts = vi.fn(async () => {});
+			Object.assign(plan.session, {
+				compact: async () => {
+					throw new Error("compaction failed");
+				},
+			});
+			plan.setPrompt(prompts);
+			await enterRpcPlanMode(plan.session);
+			await submitRpcPlanReview(plan.session, "Compact failure");
+
+			const result = await approveRpcPlanProposal(
+				plan.session,
+				undefined,
+				"compact-context",
+				executionModel,
+			);
+
+			expect(result).toMatchObject({ decision: "approved", compaction: { outcome: "failed" } });
+			expect(plan.activeModelId()).toBe("execution-model");
+			expect(plan.session.getPlanModeState()).toBeUndefined();
+			expect(prompts).toHaveBeenCalledTimes(1);
+		} finally {
+			await tempDir.remove();
+		}
+	});
+
 	test("makes concurrent plan decisions exclusive and holds the transition lease", async () => {
 		const tempDir = TempDir.createSync("@pi-rpc-plan-decision-");
 		try {

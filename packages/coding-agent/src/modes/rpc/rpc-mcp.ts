@@ -373,6 +373,7 @@ export async function beginRpcMCPReauth(
 			onManualCodeInput: () => nextManualInput(pending),
 			signal: abortController.signal,
 		},
+		false,
 	).then(result =>
 		queueMCPMutation(session, async () => {
 			const transitionLease = session.acquireSessionTransition();

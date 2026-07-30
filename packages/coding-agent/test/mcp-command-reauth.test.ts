@@ -8,6 +8,7 @@ import * as mcpClient from "@oh-my-pi/pi-coding-agent/mcp/client";
 import * as oauthFlow from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
 import type { MCPServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import {
+	authorizeMCP,
 	completeMCPReauth,
 	type MCPReauthPlan,
 	MCPCommandController,
@@ -209,6 +210,45 @@ describe("/mcp auth commands", () => {
 			),
 		).rejects.toThrow('server "envserver" changed or was removed');
 		expect(JSON.parse(await Bun.file(configPath).text())).toEqual({ mcpServers: {} });
+	});
+
+	test("does not persist a deferred credential when the reauth snapshot is stale", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.reload();
+		const config = { type: "http" as const, url: RAW_SERVER_URL };
+		const plan: MCPReauthPlan = {
+			name: "envserver",
+			found: { filePath: configPath, scope: "project", config, discovered: false },
+			baseConfig: config,
+			oauth: { authorizationUrl: "https://auth.example.com/authorize", tokenUrl: "https://auth.example.com/token" },
+			serverUrl: EXPANDED_SERVER_URL,
+			flowClientId: "",
+			flowClientSecret: "",
+			oauthResource: EXPANDED_SERVER_URL,
+			oauthResourceIsFallback: false,
+		};
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockResolvedValue({
+			access: "fresh-access",
+			refresh: "fresh-refresh",
+			expires: Date.now() + 3_600_000,
+		});
+		await Bun.write(configPath, JSON.stringify({ mcpServers: {} }));
+
+		const result = await authorizeMCP(
+			{ modelRegistry: { authStorage } } as never,
+			{
+				authorizationUrl: plan.oauth.authorizationUrl,
+				tokenUrl: plan.oauth.tokenUrl,
+				serverUrl: plan.serverUrl,
+			},
+			{ onAuth: () => {} },
+			false,
+		);
+
+		await expect(completeMCPReauth({ session: { modelRegistry: { authStorage } } } as never, plan, result, false)).rejects.toThrow(
+			'server "envserver" changed or was removed',
+		);
+		expect(authStorage.get(result.credentialId)).toBeUndefined();
 	});
 
 	test("uses the registration endpoint discovered from a pathful issuer", async () => {

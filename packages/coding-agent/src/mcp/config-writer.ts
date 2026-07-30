@@ -182,6 +182,7 @@ export async function updateExistingMCPServer(
 	name: string,
 	expected: MCPServerConfig,
 	config: MCPServerConfig,
+	beforeWrite?: () => Promise<void>,
 ): Promise<void> {
 	const nameError = validateServerName(name);
 	if (nameError) throw new Error(nameError);
@@ -192,6 +193,7 @@ export async function updateExistingMCPServer(
 		if (!existing.mcpServers?.[name] || !Bun.deepEquals(existing.mcpServers[name], expected)) {
 			throw new Error(`MCP reauthorization expired because server "${name}" changed or was removed.`);
 		}
+		await beforeWrite?.();
 		await writeMCPConfigFile(filePath, {
 			...existing,
 			mcpServers: { ...existing.mcpServers, [name]: config },

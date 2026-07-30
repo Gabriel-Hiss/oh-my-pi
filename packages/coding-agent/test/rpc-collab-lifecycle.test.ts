@@ -1,9 +1,13 @@
 import { describe, expect, it, vi } from "bun:test";
+import { CollabGuestLink } from "../src/collab/guest";
 import { CollabHost } from "../src/collab/host";
 import { CollabSocket } from "../src/collab/relay-client";
 import {
 	disposeRpcCollab,
 	getRpcCollabStatus,
+	isRpcCollabGuestJoining,
+	joinRpcCollabSession,
+	leaveRpcCollabSession,
 	startRpcCollabHosting,
 	stopRpcCollabHosting,
 } from "../src/modes/rpc/rpc-collab";
@@ -17,6 +21,17 @@ function fakeSession(): AgentSession {
 		},
 		emitNotice: () => {},
 		subscribe: () => () => {},
+	} as unknown as AgentSession;
+}
+
+function fakeJoinSession(): AgentSession {
+	return {
+		...fakeSession(),
+		getVibeModeState: () => undefined,
+		acquireSessionTransition: () => ({
+			run: async () => ({ result: undefined, committed: false, honorPlanDefault: false }),
+			release: () => {},
+		}),
 	} as unknown as AgentSession;
 }
 
@@ -104,6 +119,34 @@ describe("RPC collaboration hosting lifecycle", () => {
 			expect(sessionManager.onEntryAppended).toBeUndefined();
 			expect(context.collabHost).toBeUndefined();
 		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+});
+
+describe("RPC collaboration guest startup", () => {
+	it("blocks guest mutations and leaves an owned startup without waiting for welcome", async () => {
+		const startupGate = Promise.withResolvers<void>();
+		const join = vi.spyOn(CollabGuestLink.prototype, "join").mockImplementation(async () => {
+			await startupGate.promise;
+		});
+		const leave = vi.spyOn(CollabGuestLink.prototype, "leave").mockResolvedValue();
+		const session = fakeJoinSession();
+
+		try {
+			const joining = joinRpcCollabSession(session, "wss://relay.example.com");
+			expect(isRpcCollabGuestJoining(session)).toBe(true);
+
+			const leaving = leaveRpcCollabSession(session);
+			await Promise.resolve();
+			expect(leave).toHaveBeenCalledWith("left");
+
+			startupGate.resolve();
+			await Promise.all([joining, leaving]);
+			expect(isRpcCollabGuestJoining(session)).toBe(false);
+			expect(join).toHaveBeenCalledTimes(1);
+		} finally {
+			startupGate.resolve();
 			vi.restoreAllMocks();
 		}
 	});
